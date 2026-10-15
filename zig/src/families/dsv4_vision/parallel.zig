@@ -27,7 +27,7 @@ pub fn partition(c: Config, spec: Spec, rank: u32) !Slice {
     const expert = std.mem.indexOf(u8, key, ".ffn.experts.") != null or
         std.mem.indexOf(u8, key, ".ffn.shared_experts.") != null;
     const output = spec.kind == .matrix and (std.mem.eql(u8, key, "head") or
-        ends(key, ".attn.wq_b") or ends(key, ".attn.indexer.wq_b") or
+        ends(key, ".attn.wo_a") or ends(key, ".attn.wq_b") or ends(key, ".attn.indexer.wq_b") or
         ends(key, ".markov_head.markov_w2") or (expert and (ends(key, ".w1") or ends(key, ".w3"))));
     const input = spec.kind == .matrix and (ends(key, ".attn.wo_b") or (expert and ends(key, ".w2")));
     const rows = spec.kind != .matrix and (ends(key, ".attn.attn_sink") or

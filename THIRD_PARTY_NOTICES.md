@@ -375,3 +375,12 @@ The V4.1 grid and token layout were not ported. Pillow-compatible resampling
 retains its MIT-CMU notice in `LICENSES/Pillow-MIT-CMU.txt`.
 `jpeg.zig` calls the system libjpeg-turbo library through its public C API;
 no libjpeg-turbo implementation or binary is included in this repository.
+
+The original FP4/FP8 contract and source-built `dsv4_native` CUDA kernels use
+`inference/model.py`, `kernel.py` and `convert.py` at the pinned DeepSeek revision
+as mathematical references. `storage.zig`, `payloads.zig`, the original config
+fixture and `vision_graph.zig` follow those storage and graph contracts. The
+native ViT operators preserve the BF16 boundaries from `inference/vision.py`.
+The development-only `vision_reference.py` verifies that reference file's SHA256
+before loading it with the locally installed PyTorch CPU runtime. PyTorch is a
+validation dependency, is not bundled, and is not used for native inference.

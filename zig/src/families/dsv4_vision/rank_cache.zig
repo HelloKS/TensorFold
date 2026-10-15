@@ -17,11 +17,20 @@ pub const Cache = struct {
         const path = try std.fs.path.join(a, &.{ dir, "manifest.json" });
         const text = try std.Io.Dir.cwd().readFileAlloc(io, path, a, .limited(1 << 20));
         const doc = try std.json.parseFromSliceLeaky(std.json.Value, a, text, .{});
-        const identity = try field(doc, "identity");
-        if (try integer(try field(identity, "format_version")) != 1 or
+        const identity_text = try string(try field(doc, "identity"));
+        var identity_sha: [32]u8 = undefined;
+        Sha.hash(identity_text, &identity_sha, .{});
+        if (!std.mem.eql(u8, &identity_sha, &try digest(try field(doc, "identity_sha256"))))
+            return error.CacheIdentityMismatch;
+        const identity = try std.json.parseFromSliceLeaky(std.json.Value, a, identity_text, .{});
+        if (try integer(try field(identity, "format_version")) != 2 or
             try integer(try field(identity, "tp")) != 2 or
             !std.mem.eql(u8, try string(try field(identity, "model_revision")), config.model_revision))
             return error.IncompatibleRankCache;
+        if (!std.mem.eql(u8, try string(try field(identity, "storage")), c.storage.name()) or
+            try integer(try field(identity, "partition_version")) != 2) return error.IncompatibleRankCache;
+        if (!std.mem.eql(u8, &@import("cache_abi.zig").digest(), &try digest(try field(identity, "cache_code_sha256"))))
+            return error.CacheCodeChanged;
         var config_sha: [32]u8 = undefined;
         Sha.hash(config_text, &config_sha, .{});
         const sources = try field(identity, "sources");
@@ -97,4 +106,24 @@ test "cache digests and manifests reject malformed identities" {
     try std.testing.expectError(error.BadCacheManifest, field(.null, "ranks"));
     var problem: []const u8 = "";
     try std.testing.expectError(error.BadRank, Cache.open(std.testing.allocator, std.testing.io, ".", 2, config.fixture, &problem));
+}
+
+test "cache identity tampering and a different storage format are refused before GPU loading" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.testing.io;
+    var temp = std.testing.tmpDir(.{});
+    defer temp.cleanup();
+    const path = try std.fmt.allocPrint(a, ".zig-cache/tmp/{s}", .{temp.sub_path});
+    const identity = try std.json.Stringify.valueAlloc(a, .{ .format_version = 2, .tp = 2, .model_revision = config.model_revision, .storage = "exl3", .partition_version = 2 }, .{});
+    var sha: [32]u8 = undefined;
+    Sha.hash(identity, &sha, .{});
+    const doc = try std.json.Stringify.valueAlloc(a, .{ .identity = identity, .identity_sha256 = std.fmt.bytesToHex(sha, .lower) }, .{});
+    try temp.dir.writeFile(io, .{ .sub_path = "manifest.json", .data = doc });
+    var problem: []const u8 = "";
+    try std.testing.expectError(error.IncompatibleRankCache, Cache.open(a, io, path, 0, config.native_fixture, &problem));
+    const bad = try std.mem.replaceOwned(u8, a, doc, "exl3", "fp16");
+    try temp.dir.writeFile(io, .{ .sub_path = "manifest.json", .data = bad });
+    try std.testing.expectError(error.CacheIdentityMismatch, Cache.open(a, io, path, 0, config.native_fixture, &problem));
 }

@@ -86,7 +86,9 @@ extern "C" __global__ void tf_dsv4_vision_rope(__nv_bfloat16* x, uint32_t grid_w
   if (j >= head_dim / 2) return;
   const unsigned quarter = head_dim / 4;
   const float position = float(j < quarter ? row / grid_w : row % grid_w);
-  const float angle = position / powf(theta, float(2 * (j % quarter)) / float(head_dim / 2));
+  // The reference rounds the reciprocal before multiplying by position.
+  const float inv_freq = 1.0f / powf(theta, float(2 * (j % quarter)) / float(head_dim / 2));
+  const float angle = position * inv_freq;
   const float c = cosf(angle), s = sinf(angle);
   const uint64_t at = (uint64_t(row) * heads + head) * head_dim + j;
   const float a = __bfloat162float(x[at]), b = __bfloat162float(x[at + head_dim / 2]);

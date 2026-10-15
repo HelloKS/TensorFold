@@ -49,19 +49,50 @@ class LosslessSlices(unittest.TestCase):
         plan = {"items": [{"spec": {"kind": "matrix", "key": "w"}, "ranks": [part, part]}]}
         chosen = selection(catalog, plan, 0)
         self.assertEqual(chosen["w.trellis"]["shape"], [8, 8, 64])
-        self.assertEqual(chosen["w.suh"]["spans"], [(256, 256)])
-        self.assertEqual(chosen["w.svh"]["spans"], [(0, 256)])
-        self.assertEqual(chosen["w.mul1"]["spans"], [(0, 4)])
+        self.assertEqual(list(chosen["w.suh"]["spans"]), [(256, 256)])
+        self.assertEqual(list(chosen["w.svh"]["spans"]), [(0, 256)])
+        self.assertEqual(list(chosen["w.mul1"]["spans"]), [(0, 4)])
 
     def test_rank_one_does_not_store_vision_weights(self):
         plan = {"items": [{"spec": {"key": "vision.norm.weight", "kind": "float"},
                             "ranks": [{"keep": True}, {"keep": False}]}]}
         self.assertEqual(selection({}, plan, 1), {})
 
+    def test_native_payload_slices_preserve_nibbles_and_scale_bytes(self):
+        tensors = {
+            "expert.weight": {"dtype": "I8", "shape": [4, 128]},
+            "expert.scale": {"dtype": "F8_E8M0", "shape": [4, 8]},
+        }
+        weight_part = {"keep": True, "axis": 1, "first": 64, "count": 64}
+        scale_part = {"keep": True, "axis": 1, "first": 4, "count": 4}
+        plan = {"version": 2, "payloads": [
+            {"name": "expert.weight", "dtype": "i8", "shape": [4, 128], "ranks": [weight_part] * 2},
+            {"name": "expert.scale", "dtype": "f8_e8m0", "shape": [4, 8], "ranks": [scale_part] * 2},
+        ]}
+        chosen = selection(tensors, plan, 1)
+        payload = bytes(range(256)) * 2
+        actual = b"".join(payload[start:start + n] for start, n in chosen["expert.weight"]["spans"])
+        self.assertEqual(actual, b"".join(payload[r * 128 + 64:r * 128 + 128] for r in range(4)))
+        self.assertEqual(list(chosen["expert.scale"]["spans"]), [(4, 4), (12, 4), (20, 4), (28, 4)])
+        self.assertEqual(chosen["expert.weight"]["shape"], [4, 64])
+        tensors["expert.scale"]["shape"] = [4, 7]
+        with self.assertRaisesRegex(ValueError, "inspector/source tensor mismatch"):
+            selection(tensors, plan, 1)
+
     def test_shard_names_are_not_paths(self):
         self.assertTrue(safe_shard("model-00001-of-00016.safetensors"))
         for name in ["../model.safetensors", "x/model.safetensors", "C:\\model.safetensors", ""]:
             self.assertFalse(safe_shard(name))
+
+    def test_expert_row_slices_do_not_allocate_millions_of_span_tuples(self):
+        import sys
+        spans, shape = ranges([100000, 1024], 1, 1, 512, 512)
+        self.assertEqual(shape, [100000, 512])
+        self.assertEqual(spans.byte_count, 51200000)
+        self.assertEqual(next(iter(spans)), (512, 512))
+        self.assertLess(sys.getsizeof(spans), 256)
+        with self.assertRaises(ValueError):
+            ranges([2, 128], 1, -1, 0, 64)
 
 
 if __name__ == "__main__":

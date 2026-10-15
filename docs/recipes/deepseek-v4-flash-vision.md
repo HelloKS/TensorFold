@@ -1,15 +1,17 @@
-# DeepSeek-V4 Flash Vision EXL3 development
+# DeepSeek-V4 Flash Vision native FP4/FP8 and EXL3 development
 
 This branch adds native building blocks for DeepSeek-V4-Flash-Vision-Exp on two
-DGX Sparks. **It does not yet provide an end-to-end serving backend.** The CUDA
+DGX Sparks, loading either the original FP4/FP8 or EXL3 checkpoint.
+**It does not yet provide an end-to-end serving backend for either format.** The CUDA
 server's family registry has not been extended to advertise this model. An
 offline storage check, a successful projection probe or synthetic GPU checks
 must not be reported as a qualified text/vision server.
 
 The intended serving profile is 262,144 prompt-plus-output tokens per request,
 four concurrent active requests, DSpark, prefix caching, streaming and tool
-calls. The user will perform final serving validation on the two Sparks, using
-a complete 4bpw checkpoint when that checkpoint is available.
+calls. The original FP4/FP8 checkpoint is now the primary implementation target.
+EXL3 remains supported by the development probes; the user will perform final
+serving validation on the two Sparks.
 
 ## Pinned inputs
 
@@ -30,6 +32,14 @@ those original tensors.
 ## Implemented components
 
 - Config validation for the 43-layer V4 text model, the 32-layer ViT and DSpark.
+- Separate original FP4/FP8 and EXL3 storage contracts; the original graph uses
+  fused vision QKV/MLP weights and a grouped FP8 `wo_a` source matrix.
+- Native FP8-activation x FP4/FP8-weight CUDA reference projections and original
+  UE8M0 scales, including FP8-to-BF16 `wo_a` conversion. No expert expansion or
+  requantization is used; uploads stage at most 8 MiB of source bytes at a time.
+- A complete ViT/aligner graph and PNG/JPEG-to-positioned-embedding-span path.
+  The original-weight graph passes the four recorded full-graph comparisons
+  against the official CPU reference; target-device qualification remains open.
 - A complete required-tensor graph, including image embeddings, `bias_vl`, hash
   routing tables, compressed attention, all experts and the DSpark heads.
 - Bounded local safetensors-header inspection and individual tensor reads, with
@@ -50,11 +60,13 @@ those original tensors.
 
 ## Remaining integration
 
-The complete model forward, incremental compressed attention/indexer state,
+The text model forward, incremental compressed attention/indexer state,
 two-rank command/NCCL execution and the layer graph remain to be connected.
 DSpark verification/rollback, shared lane rounds, prefix snapshot save/restore,
 image-bearing HTTP requests and capability/CLI registration also remain.
-CUDA Graph and RDMA optimizations are not enabled.
+The vision span path is not connected to HTTP or text prefill. Two-Spark
+vision validation remains open. CUDA Graph, native Tensor Core
+GEMM optimizations and RDMA optimizations are not enabled.
 
 No `serve` command is documented for this model until those paths exist. The
 provided probes are development tools, not replacements for an engine.
@@ -89,7 +101,10 @@ python3 tools/dsv4-vision/prepare_cache.py \
 
 Use a new, empty output directory outside the source checkpoint. Preparation
 hashes the entire source before and after copying, preserves trellis words and
-scales without requantization, and publishes `manifest.json` last. It never
+scales without requantization, and publishes `manifest.json` last. Cache schema v2 adds the storage format, partition ABI
+and a verified canonical identity digest; regenerate v1 caches. The reader also
+requires an exact fingerprint of the storage/splitting/loading source, normalized
+for Git line endings, so a relevant code change invalidates an existing cache. It never
 overwrites an existing cache. An interrupted directory without a final manifest
 is not a usable cache. Both ranks must use the same manifest identity.
 
@@ -165,3 +180,164 @@ the applicable credits. MiaAI-Lab's AGPL GLM deployment recipe is used only as
 an operational reference; its code is not copied. The native JPEG wrapper calls
 the [TurboJPEG C API](https://github.com/libjpeg-turbo/libjpeg-turbo/blob/3.1.1/src/turbojpeg.h)
 and includes no libjpeg-turbo implementation or binary.
+
+## Original FP4/FP8 checkpoint path
+
+The reference is the original model revision in the pinned-input table.
+All 48 shard headers were inspected using bounded HTTP Range reads. The index
+contains 72,633 tensors and 167,811,372,792 payload bytes (156.2865 GiB).
+The required graph validates 35,328 FP4 expert projections, 390 FP8 projections,
+258 dense projections and 936 raw tensors. Three optional DSpark `bias_vl`
+tensors are unused because the draft graph receives text-only IDs.
+
+FP4 expert matrices are `I8[N,K/2]` containers holding low-nibble-first E2M1
+values, with `F8_E8M0[N,K/32]` scales. FP8 matrices are `F8_E4M3[N,K]` with
+`F8_E8M0[ceil(N/128),K/128]` scales. Activation quantization is per-row, per-128
+along K, using the official clamped maximum and power-of-two scale rounding.
+I8 outside the expert graph does not imply FP4. Unsupported configuration,
+missing/misshaped scales, mixed EXL3 storage, NaN FP8 and NaN scale bytes are
+rejected. Original dense vision weights stay BF16.
+
+The physical TP2 plan slices weights and their scale grids together. Both
+ranks retain half of every expert's intermediate dimension; vision and image
+special embeddings reside on rank 0. The inspected plan uses approximately
+80.39 GiB of resident weights on rank 0 and 79.52 GiB on rank 1, including the
+limited `wo_a` BF16 conversion. These are header-derived byte counts, not peak
+process/device measurements. The plan also reports dtype subtotals, freed FP8
+scales, source-buffer overlap during conversion and host staging. Add the KV
+estimate and every snapshot, scratch, communication and OS reservation before
+making any 256K/four-stream admission decision.
+
+```sh
+zig build test-dsv4-vision test-dsv4-cuda-host dsv4-inspect
+zig build dsv4-project dsv4-vision -Dtarget=aarch64-linux-gnu
+zig build fatbins -Dnvcc=nvcc -Dsm=121
+zig-out/bin/tf-dsv4-inspect /models/vision-original --plan > original-plan.json
+python3 tools/dsv4-vision/prepare_cache.py \
+  /models/vision-original /models/vision-original-tp2 \
+  --inspector zig-out/bin/tf-dsv4-inspect
+zig-out/bin/tf-dsv4-project /models/vision-original \
+  layers.0.ffn.experts.0.w1 4096 2048 input.bf16 output.f32 1 zig-out/fatbin
+```
+
+The projection probe chooses modules by checkpoint format. Original weights
+need `dsv4_native.fatbin` and `dsv4_tensor.fatbin`; they do not need EXL3 kernels.
+It supports complete source checkpoints and validates the selected matrix.
+The rank-cache reader is a family API; the probe does not accept a cache
+manifest as a complete source checkpoint.
+
+The vision probe takes BF16 channel-major patches and returns raster-ordered
+BF16 aligner embeddings. Optional `TRACE_DIR` writes each block's hidden state
+for teacher-forced debugging. The `--image` variant runs native image decoding,
+preprocessing, the complete tower and N-layout/special-embedding assembly; its
+JSON output names token IDs, image span and cache content/preprocessing hashes.
+These are offline tools, not serving commands.
+
+```sh
+zig-out/bin/tf-dsv4-vision /models/vision-original patches.bf16 \
+  28 28 aligned.bf16 zig-out/fatbin
+zig-out/bin/tf-dsv4-vision --image /models/vision-original picture.png \
+  span.bf16 zig-out/fatbin 0
+```
+
+On Windows development hosts, `dsv4-project-host` and `dsv4-vision-host` build
+CUDA probes using `nvcuda.dll`. This does not add Windows server support.
+The target server remains Linux ARM64/GB10. JPEG on Linux needs the system
+TurboJPEG library; its optional explicit path follows `POSITION`.
+
+### Numerical checks and corrected vision gate
+
+```sh
+python3 tools/dsv4-vision/check_native_cuda.py zig-out/fatbin/dsv4_native.fatbin \
+  --report native-operators.json
+python3 tools/dsv4-vision/check_checkpoint_projection.py /models/vision-original \
+  --probe zig-out/bin/tf-dsv4-project --kernels zig-out/fatbin --report projections.json
+python3 tools/dsv4-vision/check_vision_cuda.py zig-out/fatbin/dsv4_vision.fatbin \
+  --report vision-operators.json
+python3 tools/dsv4-vision/check_vision_graph.py /models/vision-original \
+  --probe zig-out/bin/tf-dsv4-vision --kernels zig-out/fatbin \
+  --official-reference /reference/inference/vision.py \
+  --grid 28x28 --grid 24x32 --report vision-graph.json
+```
+
+PyTorch is optional and used only by the last development check; the supplied
+reference file must match the pinned revision's SHA256. Without that option,
+the check uses the independent NumPy reference. Tiny 3x4 and 5x3 stress grids
+are the default and are retained because they exposed numerical sensitivity.
+All cases write a JSON receipt, and a failed full-graph comparison exits 1.
+
+The local GPU passed 528 format values, 24 native projection combinations,
+single-row/batched-row equality, the `wo_a` dequantization check and six actual
+original-weight projections. The real matrices cover FP8 attention, FP4 w1/w2,
+grouped `wo_a`, fused vision QKV and fused vision MLP. Independent FP64 maximum
+absolute projection errors ranged from 1.46e-8 to 1.24e-7. Vision operator tests
+also cover FP32/BF16/F16 normalization, fused splits, separate Q/K/V attention,
+the BF16 SiLU boundary and N-layout special-embedding assembly.
+
+The complete 32-layer ViT and aligner pass the official PyTorch CPU comparison
+using the actual original vision weights. The fixed `rtol=0.04, atol=0.04`
+tolerances, seed 22361 and input generation are unchanged.
+
+| Patch grid | Previous maximum absolute error | Corrected maximum absolute error | Result |
+| --- | ---: | ---: | --- |
+| 28x28 | 0.052734375 | 0.03955078125 | Pass |
+| 24x32 | 0.0703125 | 0.044921875 | Pass |
+
+The gate checks each element against `atol + rtol * abs(reference)`, so a
+maximum absolute error above 0.04 can still pass. The largest tolerance ratios
+are 0.948001 and 0.832127 respectively; neither case has an out-of-tolerance
+element. A repeat run produced identical output hashes. The separate default
+tiny-grid run also passes: 3x4 has maximum error 0.00439453125 and 5x3 has
+0.023681640625.
+
+RoPE now rounds the reciprocal frequency before multiplying by position, as
+the official implementation does. Attention QK dot products and probability/V
+sums use compensated FP32 accumulation to retain small terms during
+cancellation. Activations and output boundaries remain BF16; weights and
+normalization precision are unchanged. No tolerance was loosened.
+
+Two independent FP64 cancellation regressions fail on the preceding kernel
+and pass on the corrected kernel, matching FP64 results rounded to BF16.
+Their maximum errors fall from 0.499569 to 0.000431 (QK) and from 0.007691 to
+0.000121 (PV). All 12 vision operator checks and 15 tensor checks pass.
+These local original-weight results do not qualify EXL3 vision or DGX Spark.
+
+The remaining delivery gates are the complete text/DSpark graph, NCCL rank
+execution, core lane/prefix-cache/API integration, full-model numerical checks
+and the user's two-Spark 256K/four-active-request serving qualification. No
+throughput or memory-fit result for that profile has been measured here.
+
+The local PNG and JPEG integration check runs the complete vision graph twice
+per image, once from patches and once through `--image`, and requires exact
+N-layout span bytes, token IDs and positions. Both cases pass. This checks
+pipeline wiring within this implementation and is separate from the official
+full-graph comparison. Both cases were rerun after the arithmetic correction.
+
+```sh
+python3 tools/dsv4-vision/check_media_pipeline.py /models/vision-original \
+  --image-probe zig-out/bin/tf-dsv4-image \
+  --vision-probe zig-out/bin/tf-dsv4-vision --kernels zig-out/fatbin \
+  --jpeg-library /usr/lib/aarch64-linux-gnu/libturbojpeg.so.0 \
+  --report media-pipeline.json
+```
+
+Cache row ranges use compact strided descriptors instead of materializing
+millions of small row tuples. Selection metadata peaked at approximately
+30 MiB for the original checkpoint and 56 MiB for the inspected EXL3 checkpoint
+in the local Python check, excluding the separately loaded headers and plan.
+The native inspector and Python writer agree on every selected tensor and
+rank payload byte count for both complete header catalogs.
+
+The earlier [native checkpoint receipt](../../tools/dsv4-vision/receipts/2026-10-16-native-checkpoint.json)
+records the pre-fix successes and unresolved gates separately. The new
+[vision correction receipt](../../tools/dsv4-vision/receipts/2026-10-16-vision-fix.json)
+records before/after errors, per-column differences, regression tests, source
+hashes and the unchanged qualification limits. The
+[initial vision failure](../../tools/dsv4-vision/receipts/2026-10-16-native-vision-before.json)
+is retained for the normalization comparison.
+
+The final host run covers 29 family contract tests and 43 CUDA-runtime tests.
+`check-dsv4-target -Dtarget=aarch64-linux-gnu` also cross-compiles the complete
+family contract test executable; it does not run that executable on Windows.
+The native server, projection probe and vision probe cross-build for ARM64.
+The lean baseline remains 527 inherited findings with zero new findings.

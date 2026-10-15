@@ -7,11 +7,12 @@ import os
 from pathlib import Path
 import struct
 import subprocess
+from dataclasses import dataclass
 
 
-DTYPE_BYTES = {"F16": 2, "BF16": 2, "F32": 4, "I16": 2, "I32": 4, "I64": 8}
+DTYPE_BYTES = {"F16": 2, "BF16": 2, "F32": 4, "I16": 2, "I32": 4, "I64": 8, "I8": 1, "F8_E4M3": 1, "F8_E8M0": 1}
 MODEL_REVISION = "6821d6ad3681a4b137b066b76094fa82ebd0a380"
-FORMAT_VERSION = 1
+FORMAT_VERSION = 2
 
 
 def safe_shard(name):
@@ -61,15 +62,31 @@ def product(shape):
     return result
 
 
+@dataclass(frozen=True, slots=True)
+class Spans:
+    offset: int
+    stride: int
+    length: int
+    count: int
+
+    def __iter__(self):
+        for row in range(self.count):
+            yield self.offset + row * self.stride, self.length
+
+    @property
+    def byte_count(self):
+        return self.length * self.count
+
+
 def ranges(shape, itemsize, axis=None, first=0, count=0):
     if axis is None:
-        return [(0, product(shape) * itemsize)], list(shape)
-    if axis >= len(shape) or first < 0 or count <= 0 or first + count > shape[axis]:
+        return Spans(0, 0, product(shape) * itemsize, 1), list(shape)
+    if not isinstance(axis, int) or axis < 0 or axis >= len(shape) or first < 0 or count <= 0 or first + count > shape[axis]:
         raise ValueError("slice outside tensor")
     inside = product(shape[axis + 1:]) * itemsize
     outside = product(shape[:axis])
     stride = shape[axis] * inside
-    selected = [(row * stride + first * inside, count * inside) for row in range(outside)]
+    selected = Spans(first * inside, stride, count * inside, outside)
     local = list(shape)
     local[axis] = count
     return selected, local
@@ -88,6 +105,17 @@ def selection(catalog_, plan, rank):
         spans, shape = ranges(tensor["shape"], DTYPE_BYTES[dtype], axis, first, count)
         chosen[name] = dict(tensor=tensor, spans=spans, shape=shape)
 
+    if plan.get("version") == 2:
+        for item in plan["payloads"]:
+            part = item["ranks"][rank]
+            if not part["keep"]:
+                continue
+            name = item["name"]
+            tensor = catalog_[name]
+            if tensor["dtype"].lower() != item["dtype"] or tensor["shape"] != item["shape"]:
+                raise ValueError(f"inspector/source tensor mismatch: {name}")
+            add(name, part["axis"], part["first"], part["count"])
+        return chosen
     for item in plan["items"]:
         spec, part = item["spec"], item["ranks"][rank]
         if not part["keep"]:
@@ -115,7 +143,7 @@ def write_rank(source, output, chosen):
     header, offset = {}, 0
     for name in sorted(chosen):
         entry = chosen[name]
-        size = sum(n for _, n in entry["spans"])
+        size = entry["spans"].byte_count
         header[name] = dict(dtype=entry["tensor"]["dtype"], shape=entry["shape"], data_offsets=[offset, offset + size])
         offset += size
     encoded = json.dumps(header, separators=(",", ":")).encode()
@@ -170,9 +198,10 @@ def prepare(source, output, inspector):
         raise ValueError("checkpoint must include its tokenizer files")
     print("Hashing immutable source checkpoint...", flush=True)
     hashes = {name: sha256(source / name) for name in sorted(names + metadata)}
-    identity = dict(format_version=FORMAT_VERSION, model_revision=MODEL_REVISION, tp=2, sources=hashes,
+    identity = dict(storage=plan["storage"], cache_code_sha256=plan["cache_code_sha256"], partition_version=2, format_version=FORMAT_VERSION, model_revision=MODEL_REVISION, tp=2, sources=hashes,
                     plan_sha256=hashlib.sha256(data.stdout).hexdigest())
-    identity_hash = hashlib.sha256(json.dumps(identity, sort_keys=True).encode()).hexdigest()
+    identity_text = json.dumps(identity, sort_keys=True, separators=(",", ":"))
+    identity_hash = hashlib.sha256(identity_text.encode()).hexdigest()
     output.mkdir(parents=True, exist_ok=True)
     ranks = []
     for rank in (0, 1):
@@ -182,7 +211,7 @@ def prepare(source, output, inspector):
     for name, expected in hashes.items():
         if sha256(source / name) != expected:
             raise ValueError(f"source changed while preparing cache: {name}")
-    manifest = dict(identity=identity, identity_sha256=identity_hash, ranks=ranks,
+    manifest = dict(identity=identity_text, identity_sha256=identity_hash, ranks=ranks,
                     kv_memory=plan["kv_memory"], model_qualified=False)
     temporary = output / "manifest.tmp"
     temporary.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")

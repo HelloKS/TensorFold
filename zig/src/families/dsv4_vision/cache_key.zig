@@ -3,6 +3,16 @@ const std = @import("std");
 const Span = @import("image_layout.zig").Span;
 const Sha = std.crypto.hash.sha2.Sha256;
 
+pub fn namespace(storage: @import("storage.zig").Storage, checkpoint: [32]u8, tokenizer: [32]u8) [32]u8 {
+    var hash: Sha = .init(.{});
+    hash.update("TensorFold/dsv4/inference-state/v2\x00");
+    hash.update(storage.name());
+    if (storage == .exl3) hash.update(@tagName(storage.exl3));
+    hash.update(&checkpoint);
+    hash.update(&tokenizer);
+    return hash.finalResult();
+}
+
 pub const Image = struct {
     span: Span,
     content: [32]u8,
@@ -10,7 +20,7 @@ pub const Image = struct {
 };
 
 /// The namespace includes the immutable checkpoint and arithmetic ABI; returned IDs are for cache lookup only.
-pub fn tokens(a: std.mem.Allocator, prompt: []const u32, images: []const Image, namespace: [32]u8) ![]u32 {
+pub fn tokens(a: std.mem.Allocator, prompt: []const u32, images: []const Image, model_namespace: [32]u8) ![]u32 {
     const out = try a.dupe(u32, prompt);
     errdefer a.free(out);
     var previous: u32 = 0;
@@ -20,7 +30,7 @@ pub fn tokens(a: std.mem.Allocator, prompt: []const u32, images: []const Image, 
             return error.InvalidImageSpans;
         var hash: Sha = .init(.{});
         hash.update("TensorFold/dsv4/image-prefix/v1\x00");
-        hash.update(&namespace);
+        hash.update(&model_namespace);
         hash.update(&image.content);
         hash.update(&image.preprocessing);
         var position: [8]u8 = undefined;
@@ -64,4 +74,12 @@ test "preprocessing and model identity participate in media cache keys" {
     const second = try tokens(a, &prompt, &images, @splat(1));
     defer a.free(second);
     try std.testing.expect(!std.mem.eql(u32, first, second));
+}
+
+test "native and EXL3 cannot share a state namespace at the same model revision" {
+    const native = namespace(.native_fp4_fp8, @splat(1), @splat(2));
+    const exl3 = namespace(.{ .exl3 = .mul1 }, @splat(1), @splat(2));
+    try std.testing.expect(!std.mem.eql(u8, &native, &exl3));
+    const changed = namespace(.native_fp4_fp8, @splat(3), @splat(2));
+    try std.testing.expect(!std.mem.eql(u8, &native, &changed));
 }

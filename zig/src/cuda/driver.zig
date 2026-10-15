@@ -1,4 +1,4 @@
-//! The CUDA driver opened at run time: libcuda.so.1's versioned entry points in one table, and checked calls.
+//! The CUDA driver opened at run time: versioned entry points in one table, and checked calls.
 
 const std = @import("std");
 const platform = @import("sys");

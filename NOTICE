@@ -3,6 +3,7 @@ TensorFold
 DeepSeek-V4-Flash-Vision-Exp development changes (2026)
 This fork is based on ashhart/TensorFold c7137bb31a7dad924fb541a7068422127b9a94b2.
 Added the dsv4_vision model contract, image layout, validation and operator work.
+Added native FP4/FP8 loading, physical TP2 slices and the ViT/aligner graph.
 Modified build integration and added source credits near the start of README.md.
 DeepSeek's MIT reference was used for model semantics and image preprocessing;
 the license is retained in LICENSES/DeepSeek-V4-Flash-Vision-MIT.txt.

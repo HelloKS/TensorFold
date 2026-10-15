@@ -33,11 +33,19 @@ pub fn main(init: std.process.Init) !u8 {
     defer context.deinit();
     var stream = try cuda.Stream.init(&driver, true);
     defer stream.deinit();
-    var exl3 = try cuda.dsv4_exl3.Projection.loadImage(&driver, try image(a, init.io, args[8], "exl3.fatbin"));
-    defer exl3.unload();
+    var exl3: ?cuda.dsv4_exl3.Projection = if (c.storage == .exl3)
+        try cuda.dsv4_exl3.Projection.loadImage(&driver, try image(a, init.io, args[8], "exl3.fatbin"))
+    else
+        null;
+    defer if (exl3) |*ops| ops.unload();
+    var native: ?cuda.dsv4_native.Ops = if (c.storage == .native_fp4_fp8)
+        try cuda.dsv4_native.Ops.loadImage(&driver, try image(a, init.io, args[8], "dsv4_native.fatbin"))
+    else
+        null;
+    defer if (native) |*ops| ops.unload();
     var tensor = try cuda.dsv4_tensor.Ops.loadImage(&driver, try image(a, init.io, args[8], "dsv4_tensor.fatbin"));
     defer tensor.unload();
-    var matrix = try gpu.Matrix.load(&ck, init.gpa, init.io, &driver, args[2], k, n, c.codebook);
+    var matrix = try gpu.Matrix.load(&ck, init.gpa, init.io, &driver, args[2], k, n, c.storage);
     defer matrix.free();
     const bytes = try std.Io.Dir.cwd().readFileAlloc(init.io, args[5], a, .limited(128 << 20));
     if (bytes.len != @as(usize, rows) * k * 2) return error.BadInputSize;
@@ -47,7 +55,7 @@ pub fn main(init: std.process.Init) !u8 {
     defer y.free();
     var scratch: gpu.Scratch = .{};
     defer scratch.free();
-    try matrix.run(exl3, tensor, stream, &scratch, x.ptr, y.ptr, rows, .bf16, .f32);
+    try matrix.run(exl3, native, tensor, stream, &scratch, x.ptr, y.ptr, rows, .bf16, .f32);
     try stream.synchronize();
     const output = try a.alloc(u8, y.len);
     try y.download(0, output);

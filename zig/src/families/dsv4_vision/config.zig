@@ -54,7 +54,7 @@ pub const Config = struct {
     vision_rope_theta: f64,
     compress_ratios: [46]u8,
     dspark_target_layer_ids: [3]u8,
-    codebook: fmt.Codebook,
+    storage: @import("storage.zig").Storage,
     rope_factor: f64,
     beta_fast: f64,
     beta_slow: f64,
@@ -67,12 +67,8 @@ pub const Config = struct {
         const o = parsed.value.object;
         if (!stringIs(o, "model_type", "deepseek_v4")) return error.WrongModel;
         if (!stringIs(o, "scoring_func", "sqrtsoftplus")) return error.UnsupportedRouting;
-        const q = try object(o, "quantization_config");
-        if (!stringIs(q, "quant_method", "exl3")) return error.UnsupportedQuantization;
-        const name = q.get("codebook") orelse return error.MissingCodebook;
-        if (name != .string) return error.MissingCodebook;
         var c: Config = undefined;
-        c.codebook = std.meta.stringToEnum(fmt.Codebook, name.string) orelse return error.UnsupportedCodebook;
+        c.storage = try @import("storage.zig").Storage.parse(o);
         inline for (@typeInfo(Config).@"struct".field_names) |field| {
             const T = @FieldType(Config, field);
             if (comptime (T == usize or T == u32) and !std.mem.eql(u8, field, "original_max_position_embeddings"))
@@ -167,7 +163,7 @@ pub const fixture = @embedFile("fixtures/config.json");
 
 test "the real EXL3 config accepts arbitrary model average bits" {
     const c = try Config.parse(std.testing.allocator, fixture);
-    try std.testing.expectEqual(fmt.Codebook.mul1, c.codebook);
+    try std.testing.expectEqual(fmt.Codebook.mul1, c.storage.exl3);
     try std.testing.expectEqual(@as(u8, 128), c.compress_ratios[3]);
     const four = try std.mem.replaceOwned(u8, std.testing.allocator, fixture, "3.04", "4.0");
     defer std.testing.allocator.free(four);
@@ -190,4 +186,17 @@ test "wrong models, missing vision and mismatched compression cannot claim this 
     var c = try Config.parse(a, fixture);
     c.compress_ratios[3] = 2;
     try std.testing.expectError(error.UnsupportedAttentionSchedule, c.validate());
+}
+
+pub const native_fixture = @embedFile("fixtures/native_config.json");
+
+test "native storage requires the original FP4 FP8 quantization contract" {
+    const a = std.testing.allocator;
+    const c = try Config.parse(a, native_fixture);
+    try std.testing.expect(c.storage == .native_fp4_fp8);
+    inline for (.{ .{ "ue8m0", "float32" }, .{ "e4m3", "e5m2" }, .{ "dynamic", "static" } }) |pair| {
+        const bad = try std.mem.replaceOwned(u8, a, native_fixture, pair[0], pair[1]);
+        defer a.free(bad);
+        try std.testing.expectError(error.UnsupportedQuantization, Config.parse(a, bad));
+    }
 }

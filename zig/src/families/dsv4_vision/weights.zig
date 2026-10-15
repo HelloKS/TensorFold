@@ -4,6 +4,7 @@ const core = @import("core");
 const Config = @import("config.zig").Config;
 const st = core.safetensors;
 const fmt = core.exl3_format;
+const storage = @import("storage.zig");
 
 pub const Kind = enum { float, ids, matrix };
 pub const Spec = struct { key: []const u8, shape: [3]usize = @splat(1), rank: usize, kind: Kind };
@@ -43,7 +44,9 @@ const Builder = struct {
         try b.linear(p, ".attn.wq_b", c.q_lora_rank, c.num_attention_heads * c.head_dim);
         try b.linear(p, ".attn.wkv", d, c.head_dim);
         try b.linear(p, ".attn.wo_b", c.o_groups * c.o_lora_rank, d);
-        for (0..c.o_groups) |group| {
+        if (c.storage == .native_fp4_fp8) {
+            try b.linear(p, ".attn.wo_a", c.num_attention_heads / c.o_groups * c.head_dim, c.o_groups * c.o_lora_rank);
+        } else for (0..c.o_groups) |group| {
             const key = try std.fmt.allocPrint(b.a, "{s}.attn.wo_a.slice.{d}", .{ p, group });
             try b.linear(key, "", c.num_attention_heads / c.o_groups * c.head_dim, c.o_lora_rank);
         }
@@ -110,12 +113,20 @@ pub fn requirements(a: std.mem.Allocator, c: Config) ![]const Spec {
     for (0..c.vision_n_layers) |i| {
         const p = try std.fmt.allocPrint(a, "vision.blocks.{d}", .{i});
         inline for (.{ "norm1", "norm2" }) |n| try b.tensor(p, "." ++ n ++ ".weight", &.{c.vision_dim}, .float);
-        inline for (.{ "q_proj", "k_proj", "v_proj", "wo" }) |n| {
-            try b.linear(p, ".attn." ++ n, c.vision_dim, c.vision_dim);
-            try b.tensor(p, ".attn." ++ n ++ ".bias", &.{c.vision_dim}, .float);
+        if (c.storage == .native_fp4_fp8) {
+            try b.linear(p, ".attn.wqkv", c.vision_dim, 3 * c.vision_dim);
+            try b.tensor(p, ".attn.wqkv.bias", &.{3 * c.vision_dim}, .float);
+            try b.linear(p, ".attn.wo", c.vision_dim, c.vision_dim);
+            try b.tensor(p, ".attn.wo.bias", &.{c.vision_dim}, .float);
+            try b.linear(p, ".mlp.w1", c.vision_dim, 2 * c.vision_inter_dim);
+        } else {
+            inline for (.{ "q_proj", "k_proj", "v_proj", "wo" }) |n| {
+                try b.linear(p, ".attn." ++ n, c.vision_dim, c.vision_dim);
+                try b.tensor(p, ".attn." ++ n ++ ".bias", &.{c.vision_dim}, .float);
+            }
+            inline for (.{ "gate_proj", "up_proj" }) |n|
+                try b.linear(p, ".mlp." ++ n, c.vision_dim, c.vision_inter_dim);
         }
-        inline for (.{ "gate_proj", "up_proj" }) |n|
-            try b.linear(p, ".mlp." ++ n, c.vision_dim, c.vision_inter_dim);
         try b.linear(p, ".mlp.w2", c.vision_inter_dim, c.vision_dim);
     }
     try b.tensor("vision.norm", ".weight", &.{c.vision_dim}, .float);
@@ -160,7 +171,7 @@ pub const Matrix = struct {
     }
 };
 
-pub const Summary = struct { matrices: usize = 0, dense: usize = 0, raw: usize = 0 };
+pub const Summary = struct { matrices: usize = 0, dense: usize = 0, raw: usize = 0, fp4: usize = 0, fp8: usize = 0 };
 
 /// The headers already passed safetensors bounds validation; errors name the missing or incompatible tensor.
 pub fn validate(a: std.mem.Allocator, c: Config, headers: st.Header, problem: *[]const u8) !Summary {
@@ -188,10 +199,16 @@ pub fn validateSpecs(a: std.mem.Allocator, c: Config, specs: []const Spec, heade
             continue;
         }
         const trellis_name = try std.fmt.allocPrint(aa, "{s}.trellis", .{spec.key});
-        if (headers.get(trellis_name)) |t| {
+        if (c.storage == .native_fp4_fp8) {
+            if (headers.contains(trellis_name)) {
+                problem.* = try a.dupe(u8, trellis_name);
+                return error.MixedStorage;
+            }
+            try validateNative(a, aa, spec, headers, problem, &summary);
+        } else if (headers.get(trellis_name)) |t| {
             const su = try std.fmt.allocPrint(aa, "{s}.suh", .{spec.key});
             const sv = try std.fmt.allocPrint(aa, "{s}.svh", .{spec.key});
-            const marker = try std.fmt.allocPrint(aa, "{s}.{t}", .{ spec.key, c.codebook });
+            const marker = try std.fmt.allocPrint(aa, "{s}.{t}", .{ spec.key, c.storage.exl3 });
             const suh = headers.get(su) orelse {
                 problem.* = try a.dupe(u8, su);
                 return error.MissingTensor;
@@ -200,7 +217,7 @@ pub fn validateSpecs(a: std.mem.Allocator, c: Config, specs: []const Spec, heade
                 problem.* = try a.dupe(u8, sv);
                 return error.MissingTensor;
             };
-            if (c.codebook == .mul1) {
+            if (c.storage.exl3 == .mul1) {
                 const m = headers.get(marker) orelse {
                     problem.* = try a.dupe(u8, marker);
                     return error.MissingTensor;
@@ -210,7 +227,7 @@ pub fn validateSpecs(a: std.mem.Allocator, c: Config, specs: []const Spec, heade
                     return error.UnexpectedTensor;
                 }
             }
-            _ = Matrix.parse(t, suh, svh, spec.shape[0], spec.shape[1], c.codebook) catch |e| {
+            _ = Matrix.parse(t, suh, svh, spec.shape[0], spec.shape[1], c.storage.exl3) catch |e| {
                 problem.* = try a.dupe(u8, trellis_name);
                 return e;
             };
@@ -232,6 +249,35 @@ pub fn validateSpecs(a: std.mem.Allocator, c: Config, specs: []const Spec, heade
         }
     }
     return summary;
+}
+
+fn validateNative(a: std.mem.Allocator, aa: std.mem.Allocator, spec: Spec, headers: st.Header, problem: *[]const u8, summary: *Summary) !void {
+    const name = try std.fmt.allocPrint(aa, "{s}.weight", .{spec.key});
+    const t = headers.get(name) orelse {
+        problem.* = try a.dupe(u8, name);
+        return error.MissingTensor;
+    };
+    const sn = try std.fmt.allocPrint(aa, "{s}.scale", .{spec.key});
+    if (storage.dense(spec.key)) {
+        var dense = spec;
+        dense.shape[0] = spec.shape[1];
+        dense.shape[1] = spec.shape[0];
+        if (t.dtype != .bf16 or !matches(t, dense) or headers.contains(sn)) {
+            problem.* = try a.dupe(u8, name);
+            return error.UnexpectedTensor;
+        }
+        summary.dense += 1;
+        return;
+    }
+    const scale = headers.get(sn) orelse {
+        problem.* = try a.dupe(u8, sn);
+        return error.MissingTensor;
+    };
+    const q = storage.matrix(t, scale, spec.key, spec.shape[0], spec.shape[1]) catch |e| {
+        problem.* = try a.dupe(u8, if (e == error.BadNativeScale) sn else name);
+        return e;
+    };
+    if (q == .fp4) summary.fp4 += 1 else summary.fp8 += 1;
 }
 
 test "missing image bias is rejected before any CUDA work" {
@@ -266,4 +312,37 @@ test "EXL3 width comes from the tensor rather than the checkpoint's average bpw"
     try std.testing.expectEqual(@as(u16, 8), (try Matrix.parse(t, su, sv, 4096, 2048, .mcg)).width.halves);
     t.shape[2] = 56;
     try std.testing.expectError(error.UnsupportedExl3Width, Matrix.parse(t, su, sv, 4096, 2048, .mcg));
+}
+
+test "native missing scales and mixed EXL3 storage report the exact tensor" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = try Config.parse(a, @import("config.zig").native_fixture);
+    var h: st.Header = .empty;
+    const spec: Spec = .{ .key = "layers.0.attn.wq_a", .rank = 2, .shape = .{ 4096, 1024, 1 }, .kind = .matrix };
+    const w: st.Entry = .{ .dtype = .f8_e4m3, .rank = 2, .shape = .{ 1024, 4096, 1, 1, 1 }, .begin = 0, .end = 0 };
+    try h.put(a, "layers.0.attn.wq_a.weight", w);
+    var problem: []const u8 = "";
+    try std.testing.expectError(error.MissingTensor, validateSpecs(a, c, &.{spec}, h, &problem));
+    try std.testing.expectEqualStrings("layers.0.attn.wq_a.scale", problem);
+    try h.put(a, "layers.0.attn.wq_a.trellis", w);
+    try std.testing.expectError(error.MixedStorage, validateSpecs(a, c, &.{spec}, h, &problem));
+    try std.testing.expectEqualStrings("layers.0.attn.wq_a.trellis", problem);
+}
+
+test "native vision requires fused projections while EXL3 requires the selected split projections" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const c = try Config.parse(a, @import("config.zig").native_fixture);
+    var fused = false;
+    for (try requirements(a, c)) |spec| {
+        if (std.mem.eql(u8, spec.key, "vision.blocks.0.attn.wqkv")) {
+            try std.testing.expectEqual(@as(usize, 3072), spec.shape[1]);
+            fused = true;
+        }
+        try std.testing.expect(!std.mem.eql(u8, spec.key, "vision.blocks.0.attn.q_proj"));
+    }
+    try std.testing.expect(fused);
 }

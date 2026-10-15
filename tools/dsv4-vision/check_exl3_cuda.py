@@ -61,11 +61,11 @@ class Driver:
         self.call("cuMemcpyDtoH_v2", C.c_void_p(out.ctypes.data), ptr, C.c_size_t(out.nbytes))
         return out
 
-    def launch(self, name, grid, block, *args):
+    def launch(self, name, grid, block, *args, shared=0):
         fn = C.c_void_p()
         self.call("cuModuleGetFunction", C.byref(fn), self.module, name.encode())
         values = (C.c_void_p * len(args))(*(C.addressof(a) for a in args))
-        self.call("cuLaunchKernel", fn, *grid, *block, 0, C.c_void_p(), values, C.c_void_p())
+        self.call("cuLaunchKernel", fn, *grid, *block, shared, C.c_void_p(), values, C.c_void_p())
         self.call("cuCtxSynchronize")
 
 

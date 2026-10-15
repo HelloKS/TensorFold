@@ -1,0 +1,421 @@
+{
+  "date": "2026-10-16",
+  "upstream_base": "c7137bb31a7dad924fb541a7068422127b9a94b2",
+  "model_revision": "6821d6ad3681a4b137b066b76094fa82ebd0a380",
+  "base_commit": "3403196d493b92a644dd8b5bcc951639f8bc35d8",
+  "uncommitted_patch": true,
+  "environment": {
+    "os": "Windows",
+    "gpu": "NVIDIA GeForce RTX 5070 Ti, 617.14, 12.0",
+    "zig": "0.17.0",
+    "cuda": "13.1",
+    "torch_reference": "2.14.1+cpu"
+  },
+  "build": {
+    "steps_passed": 32,
+    "host_tests_passed": 72,
+    "linux_arm64_server_crossbuild": true,
+    "linux_arm64_projection_and_vision_crossbuild": true,
+    "fatbin_targets": [
+      "sm120",
+      "sm121"
+    ],
+    "sm86_compile_only": true,
+    "flags": [
+      "-O3",
+      "--fmad=false",
+      "--ftz=false",
+      "--prec-div=true",
+      "--prec-sqrt=true"
+    ],
+    "host_test_breakdown": {
+      "family": 29,
+      "cuda_runtime": 43
+    },
+    "latest_family_contract_build_steps": 10,
+    "arm64_family_contract_crossbuild_steps": 3,
+    "linux_arm64_family_contract_crossbuild": true
+  },
+  "catalog": {
+    "shards": 48,
+    "indexed_tensors": 72633,
+    "payload_bytes": 167811372792,
+    "summary": {
+      "matrices": 0,
+      "dense": 258,
+      "raw": 936,
+      "fp4": 35328,
+      "fp8": 390
+    },
+    "index_sha256": "507977e3d3818865264e68c0fdab139aa7f3929d0d0cf693dacc47428da56395",
+    "headers_sha256": "f3ff6340f36a1de2f5c717a79ee1af0f75c7375f6bb17d897b2d1f27a517cc2e",
+    "weight_memory": [
+      {
+        "payload_bytes": 85542202616,
+        "by_dtype": [
+          {
+            "dtype": "i8",
+            "bytes": 74088185856
+          },
+          {
+            "dtype": "bf16",
+            "bytes": 3331789568
+          },
+          {
+            "dtype": "f32",
+            "bytes": 151007736
+          },
+          {
+            "dtype": "i64",
+            "bytes": 18616320
+          },
+          {
+            "dtype": "f8_e4m3",
+            "bytes": 3321888768
+          },
+          {
+            "dtype": "f8_e8m0",
+            "bytes": 4630714368
+          }
+        ],
+        "converted_bf16_bytes": 1543503872,
+        "replaced_fp8_bytes": 771751936,
+        "resident_weight_bytes": 86313907448,
+        "released_scale_bytes": 47104,
+        "conversion_old_weight_peak": 16777216,
+        "host_staging_bytes": 8388608
+      },
+      {
+        "payload_bytes": 84609416440,
+        "by_dtype": [
+          {
+            "dtype": "i8",
+            "bytes": 74088185856
+          },
+          {
+            "dtype": "bf16",
+            "bytes": 2399003392
+          },
+          {
+            "dtype": "f32",
+            "bytes": 151007736
+          },
+          {
+            "dtype": "i64",
+            "bytes": 18616320
+          },
+          {
+            "dtype": "f8_e4m3",
+            "bytes": 3321888768
+          },
+          {
+            "dtype": "f8_e8m0",
+            "bytes": 4630714368
+          }
+        ],
+        "converted_bf16_bytes": 1543503872,
+        "replaced_fp8_bytes": 771751936,
+        "resident_weight_bytes": 85381121272,
+        "released_scale_bytes": 47104,
+        "conversion_old_weight_peak": 16777216,
+        "host_staging_bytes": 8388608
+      }
+    ],
+    "header_only": true
+  },
+  "cache": {
+    "unit_tests_passed": 7,
+    "plan_checks": {
+      "native": [
+        {
+          "rank": 0,
+          "tensors": 72630,
+          "bytes": 85542202616,
+          "selection_peak_python_bytes": 29751520
+        },
+        {
+          "rank": 1,
+          "tensors": 72363,
+          "bytes": 84609416440,
+          "selection_peak_python_bytes": 31542384
+        }
+      ],
+      "exl3": [
+        {
+          "rank": 0,
+          "tensors": 145831,
+          "bytes": 60080104372,
+          "selection_peak_python_bytes": 56276128
+        },
+        {
+          "rank": 1,
+          "tensors": 144726,
+          "bytes": 59786168364,
+          "selection_peak_python_bytes": 58172224
+        }
+      ]
+    },
+    "complete_model_cache_written": false,
+    "cache_code_sha256": "bdb2f7ba8a1046813efac2d6bfea55ed576e4881364efd2d4ca67a2c27ad1092"
+  },
+  "cuda_native": {
+    "format_states": 528,
+    "projections": {
+      "passed": 24,
+      "max_abs": 0.006047825561836362,
+      "worst_column_by_case": [
+        0.0001199730031657964,
+        0.00024261614817078225,
+        0.000877860304171918,
+        5.9371814131736755e-09,
+        1.4606484910473228e-08,
+        3.070817911066115e-08,
+        0.00012206478277221322,
+        0.00024088433201541193,
+        0.0004331288691901136,
+        1.5425030142068863e-09,
+        2.062006387859583e-08,
+        3.61455931852106e-08,
+        0.0018244110979139805,
+        0.003830801695585251,
+        0.006047825561836362,
+        2.8870999813079834e-08,
+        1.234002411365509e-07,
+        2.2491440176963806e-07,
+        0.0018969373777508736,
+        0.0038813003338873386,
+        0.005909978877753019,
+        2.7008354663848877e-08,
+        6.57164491713047e-08,
+        2.505257725715637e-07
+      ],
+      "row_invariance": true
+    },
+    "wo_a_dequant": 1,
+    "full_model_executed": false,
+    "dgx_spark_executed": false
+  },
+  "cuda_vision": {
+    "passed": 10,
+    "full_model_executed": false
+  },
+  "real_projection_checks": [
+    {
+      "tensor": "layers.0.attn.wq_a",
+      "input_shape": [
+        4,
+        4096
+      ],
+      "dtype": "F8_E4M3",
+      "weight_sha256": "eaeaf0359e8722b6be070e722a45064d133eddfc1e3feb3aa7700073d49bd1cd",
+      "max_abs": 7.520429790019989e-08,
+      "worst_column": 166
+    },
+    {
+      "tensor": "layers.0.attn.wo_a",
+      "input_shape": [
+        4,
+        4096
+      ],
+      "dtype": "F8_E4M3",
+      "weight_sha256": "2b20674b8755bfd5af9d0974715b5547915b12e1d3fcb9c2ba1753607aac2771",
+      "max_abs": 2.8638169169425964e-08,
+      "worst_column": 1857
+    },
+    {
+      "tensor": "layers.0.ffn.experts.0.w1",
+      "input_shape": [
+        4,
+        4096
+      ],
+      "dtype": "I8",
+      "weight_sha256": "25456d463fc22a706527e745d5509853cbb96e3cdc950a861b1eaeb765e93ea6",
+      "max_abs": 2.9802322387695312e-08,
+      "worst_column": 800
+    },
+    {
+      "tensor": "layers.0.ffn.experts.0.w2",
+      "input_shape": [
+        4,
+        2048
+      ],
+      "dtype": "I8",
+      "weight_sha256": "c6ea568b95c863c7e5fae47a7d86cb6965f9165091dc7edb7c9b9ecf9bba5896",
+      "max_abs": 1.4901161193847656e-08,
+      "worst_column": 53
+    },
+    {
+      "tensor": "vision.blocks.0.attn.wqkv",
+      "input_shape": [
+        4,
+        1024
+      ],
+      "dtype": "BF16",
+      "weight_sha256": "bdfae5bf366f42af8e2d780d15888ca775ed99f0bdbcfe8ee61fe8d2263febe2",
+      "max_abs": 1.2392592907417566e-07,
+      "worst_column": 464
+    },
+    {
+      "tensor": "vision.blocks.0.mlp.w1",
+      "input_shape": [
+        4,
+        1024
+      ],
+      "dtype": "BF16",
+      "weight_sha256": "aa83292fd49a3f9981924e5c25ab28a6434c95388a97c5b960a44676d5bfa1a3",
+      "max_abs": 1.4574652595911175e-08,
+      "worst_column": 5187
+    }
+  ],
+  "legacy_cuda": {
+    "exl3": {
+      "codebook_states": 196608,
+      "projection_cases": 21,
+      "worst_abs_error": 3.775706417741276e-06,
+      "row_invariant": true,
+      "model_qualified": false
+    },
+    "model_ops": {
+      "checks": {
+        "routing": 2,
+        "sinkhorn": 2,
+        "quantization": 2,
+        "attention": 1,
+        "pooling_and_unfold": 2
+      },
+      "passed": 9,
+      "model_qualified": false
+    },
+    "tensor_ops": {
+      "checks": {
+        "dense": 12,
+        "embeddings": 2,
+        "vision_rotary": 1
+      },
+      "passed": 15,
+      "model_qualified": false
+    }
+  },
+  "native_images": {
+    "image_layout_patch_cases": 84,
+    "patches_bit_exact": true,
+    "jpeg_checked": true,
+    "model_qualified": false
+  },
+  "media_pipeline": {
+    "passed": 2,
+    "cases": [
+      {
+        "format": "png",
+        "position": 0,
+        "tokens": 117,
+        "span": {
+          "start": 3,
+          "end": 117
+        },
+        "bit_exact": true
+      },
+      {
+        "format": "jpg",
+        "position": 5,
+        "tokens": 116,
+        "span": {
+          "start": 7,
+          "end": 121
+        },
+        "bit_exact": true
+      }
+    ],
+    "vision_fidelity_qualified": false,
+    "language_model_executed": false,
+    "dgx_spark_executed": false
+  },
+  "vision_fidelity": {
+    "reference": "official PyTorch CPU",
+    "rtol": 0.04,
+    "atol": 0.04,
+    "passed": 0,
+    "failed": 2,
+    "cases": [
+      {
+        "passed": false,
+        "grid": [
+          28,
+          28
+        ],
+        "layers": 32,
+        "max_abs": 0.052734375,
+        "rms": 0.002391905291005969,
+        "output_sha256": "16d4434b993a058ccd0550f8e9e87c967c65b428494eeb908127ad6179e9e495"
+      },
+      {
+        "passed": false,
+        "grid": [
+          24,
+          32
+        ],
+        "layers": 32,
+        "max_abs": 0.0703125,
+        "rms": 0.0022682766430079937,
+        "output_sha256": "7707d4b966e72d7586bdc86a362ab8459ae60682943596555b157a78528de6de"
+      }
+    ]
+  },
+  "gates": {
+    "native_loader_and_projection": true,
+    "vision_graph_connected": true,
+    "vision_fidelity": false,
+    "text_graph": false,
+    "nccl_rank_execution": false,
+    "dspark_integration": false,
+    "prefix_cache_engine_integration": false,
+    "http_images": false,
+    "profile_memory_admission": false,
+    "serving_backend_complete": false,
+    "dgx_spark_executed": false
+  },
+  "checks": {
+    "diff_whitespace": "pass",
+    "lean_inherited_findings": 527,
+    "lean_new_findings": 0,
+    "full_server_and_golden_suite": "not run on Windows; inherited POSIX platform restrictions"
+  },
+  "source_sha256": {
+    "tools/dsv4-vision/check_checkpoint_projection.py": "9df26cb78a366bb06a765f2589a738c5115c408e27397dfe3561c58221fea62e",
+    "tools/dsv4-vision/check_exl3_cuda.py": "f4db3ff78943b24c16e58515f8577ad4f8499b72dd6a1c6da0b706df0432319e",
+    "tools/dsv4-vision/check_media_pipeline.py": "0cef183f63151a219098f4f373e0d7989a9599ef45d6d855e31f55541ab5aedf",
+    "tools/dsv4-vision/check_native_cuda.py": "18d74c681bcc7f837b1e67917ac96e3aff8bd93059beec60ac881b3e84637d66",
+    "tools/dsv4-vision/check_vision_cuda.py": "ea78a30d7e20501437d02b783920eaedb46a32b07468991d1586a5d2b677da1f",
+    "tools/dsv4-vision/check_vision_graph.py": "0d567805f4a5e5c165775dbbaad925289d32e7bcd7903a830a4b98cf4e18ca1f",
+    "tools/dsv4-vision/prepare_cache.py": "930f1050beeea55281660eea030fffd15402c64de03734fa17522ccc77633169",
+    "tools/dsv4-vision/test_prepare_cache.py": "fbb5c608c62be69f30edfe568d9fa4a4c505512705a9b3fdf1aec64a2823c322",
+    "tools/dsv4-vision/vision_reference.py": "00fb369b2cea4923ac18e0f622d6ed40cf6bb8add3c092c48d9bceda75d51095",
+    "zig/build/cuda.zig": "58b189abb974af62529880524624471cd6f6a236b4aa484515cc47c0db2f599d",
+    "zig/build/dsv4_vision.zig": "9478577af434e17fbbbc104c7b663daaed00e3fcc91dc479f85b8884fd3c782e",
+    "zig/kernels/cuda/dsv4_native.cu": "9a1ee0ac1b8bd08721842e98f36651e5468a2692b784ff3260d61a159cf05629",
+    "zig/kernels/cuda/dsv4_vision.cu": "35474e7adbdff31d2d691ae25d19485c5bb945cd1deffaa024829a6816fc884d",
+    "zig/src/cuda/driver.zig": "73dc84fb44fa79d0a03f38979184baaec6c274a81a0f7b454ee602f9b74a3ac9",
+    "zig/src/cuda/dsv4_native.zig": "b2105989e6a26813ce2d8c825c1c6272826b5b6c6447426b74efd7c03140e03e",
+    "zig/src/cuda/dsv4_vision.zig": "94c5a71b43c4a3ee343e43e2b55eb3150098146ac5437531b6ee1c4e097e09f6",
+    "zig/src/cuda/kernels.zig": "23fac3a288286a9a53e936bcad61c5f79e86464a1c36ac59904a81f3945a6635",
+    "zig/src/cuda/library.zig": "066ba754aa2d5fd8822e500c09adc295641b2b332b558f4168872296bf3fa05a",
+    "zig/src/cuda/root.zig": "efa554d976713bc62d8bb30a59689848145816302884e4553cafe54185358706",
+    "zig/src/families/dsv4_vision/cache_abi.zig": "2dd7df0b2ff5fde3a2fb887a934f8f0c3c97c4c318e0e34fe1c1062b348b35a3",
+    "zig/src/families/dsv4_vision/cache_key.zig": "33ab2cef92e86849f84f700aea79beae477156f50a1728e356ef1d9112041d3b",
+    "zig/src/families/dsv4_vision/config.zig": "f089ea251489d457af4648cb758483639a9febe95eceeb009454cc3aa2ef8660",
+    "zig/src/families/dsv4_vision/dsv4_vision.zig": "5b36b55075a47d657c84a779d80ec7d95699b2945dc1f8c4c7e15768b44a0b7d",
+    "zig/src/families/dsv4_vision/fixtures/native_config.json": "6cd841bdd6702f5e2ac34671bc78047ed80817102465525ae2a41c502abbcd75",
+    "zig/src/families/dsv4_vision/gpu_modules.zig": "abe09ac1b3d4b99b89e41a3099f715a5742c116ed4ccafde6d88d01535d3735a",
+    "zig/src/families/dsv4_vision/gpu_weights.zig": "1171c1486e85876c13a673ba6be71a690ad909e927ed3cf8fc6188f3c08d3f3a",
+    "zig/src/families/dsv4_vision/inspect_main.zig": "14da55b59fc3005942793fbcb175d33a885da5d58f9482f91f5ab35b0a315cbd",
+    "zig/src/families/dsv4_vision/media.zig": "7224fda93607aef5761a1f706defc36a97f438a49a57fd84cd8a94034bf05f8a",
+    "zig/src/families/dsv4_vision/parallel.zig": "a20cb252edbbd848d72e01208f14f434dba9da46adda73bb01e4056d20951aa9",
+    "zig/src/families/dsv4_vision/payloads.zig": "177a0b71ddb1fac9c446d0000863ce65ae3b99280c35e3818e0cfa679744b5c9",
+    "zig/src/families/dsv4_vision/project_main.zig": "903d174f732eb8f6d0577634469f2319cf25ebe1a497bbb66c10628d1ccd2587",
+    "zig/src/families/dsv4_vision/rank_cache.zig": "59cbe110730f15b8dda93c34b0c85c4acf0bd778ffc95739becdfda14d68c667",
+    "zig/src/families/dsv4_vision/storage.zig": "4c6d68ff1182b8db036c7a56decef391574b7c3384a636149de7fc8137392e10",
+    "zig/src/families/dsv4_vision/vision_graph.zig": "f8bc8f32ded71de6152c41f356a6e74b42a84410f8f0af482e778b5777acceaa",
+    "zig/src/families/dsv4_vision/vision_main.zig": "6040f068d32c3a0e6317c4323d18438bf5056887c8d9ac9018f74e705db7135e",
+    "zig/src/families/dsv4_vision/weights.zig": "1921d83c611a4babc8343619ffdee50c51d72669ca4349ce60c6e5a204186332"
+  }
+}

@@ -1,0 +1,19 @@
+{
+  "model_revision": "6821d6ad3681a4b137b066b76094fa82ebd0a380",
+  "gpu": "RTX 5070 Ti 16GB",
+  "reference": "official vision.py, PyTorch 2.14.1+cpu",
+  "input": "seed 22361, BF16 normal(0,0.2) patch rows",
+  "rtol": 0.04,
+  "atol": 0.04,
+  "valid_grid_results": [
+    {"grid": [28, 28], "pass": false, "max_abs": 0.05712890625, "rms": 0.0021371333859860897},
+    {"grid": [24, 32], "pass": false, "max_abs": 0.08203125, "rms": 0.002650696784257889}
+  ],
+  "tiny_stress_results": [
+    {"grid": [3, 4], "max_abs": 0.00390625, "rms": 0.00094428344},
+    {"grid": [5, 3], "max_abs": 0.21191406, "rms": 0.04044175}
+  ],
+  "vision_graph_qualified": false,
+  "language_model_executed": false,
+  "dgx_spark_executed": false
+}

@@ -5,6 +5,7 @@ const core = @import("core");
 const Catalog = @import("catalog.zig").Catalog;
 const weights = @import("weights.zig");
 const fmt = core.exl3_format;
+const storage = @import("storage.zig");
 const Kind = cuda.dsv4_tensor.Kind;
 const Device = cuda.DeviceBuffer;
 
@@ -18,9 +19,28 @@ pub fn kind(dtype: core.safetensors.DType) !Kind {
 }
 
 fn upload(c: *const Catalog, a: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, key: []const u8) !Device {
-    const tensor = try c.read(a, io, key);
-    defer a.free(tensor.bytes);
-    return Device.fromHost(d, tensor.bytes);
+    const entry = c.headers.get(key) orelse return error.MissingTensor;
+    const location = c.locations.get(key) orelse return error.MissingTensor;
+    var file = try std.Io.Dir.cwd().openFile(io, location.path, .{});
+    defer file.close(io);
+    const size = entry.end - entry.begin;
+    var device = try Device.alloc(d, size);
+    errdefer device.free();
+    const buffer = try a.alloc(u8, @min(size, 8 << 20));
+    defer a.free(buffer);
+    var at: usize = 0;
+    while (at < size) {
+        const block = buffer[0..@min(buffer.len, size - at)];
+        if (try file.readPositionalAll(io, block, location.data + entry.begin + at) != block.len)
+            return error.TruncatedTensor;
+        storage.validateBytes(entry.dtype, block) catch |e| {
+            std.log.err("{s}: {t}", .{ key, e });
+            return e;
+        };
+        try device.upload(at, block);
+        at += block.len;
+    }
+    return device;
 }
 
 pub const Raw = struct {
@@ -69,17 +89,24 @@ pub const Matrix = struct {
     sv: ?Device = null,
     bias: ?Device = null,
     trellis_params: ?cuda.dsv4_exl3.Params = null,
+    native_kind: ?storage.Quant = null,
+    scale: ?Device = null,
+    convert_bf16: bool = false,
     dtype: Kind = .f32,
     k: u32,
     n: u32,
 
-    pub fn load(c: *const Catalog, gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, key: []const u8, k: usize, n: usize, codebook: fmt.Codebook) !Matrix {
+    pub fn load(c: *const Catalog, gpa: std.mem.Allocator, io: std.Io, d: *const cuda.Driver, key: []const u8, k: usize, n: usize, format: storage.Storage) !Matrix {
+        if (k == 0 or n == 0 or k > std.math.maxInt(u32) or n > std.math.maxInt(u32)) return error.BadShape;
         var arena: std.heap.ArenaAllocator = .init(gpa);
         defer arena.deinit();
         const a = arena.allocator();
         const tname = try std.fmt.allocPrint(a, "{s}.trellis", .{key});
+        if (format == .native_fp4_fp8 and c.headers.contains(tname)) return error.MixedStorage;
         var m: Matrix = .{ .data = undefined, .k = @intCast(k), .n = @intCast(n) };
-        if (c.headers.get(tname)) |t| {
+        if (format == .exl3 and c.headers.contains(tname)) {
+            const codebook = format.exl3;
+            const t = c.headers.get(tname).?;
             const suname = try std.fmt.allocPrint(a, "{s}.suh", .{key});
             const svname = try std.fmt.allocPrint(a, "{s}.svh", .{key});
             const su = c.headers.get(suname) orelse return error.MissingTensor;
@@ -106,9 +133,21 @@ pub const Matrix = struct {
         } else {
             const name = try std.fmt.allocPrint(a, "{s}.weight", .{key});
             const header = c.headers.get(name) orelse return error.MissingTensor;
-            if (header.rank != 2 or header.shape[0] != n or header.shape[1] != k) return error.UnexpectedTensor;
-            m.dtype = try kind(header.dtype);
-            m.data = try upload(c, gpa, io, d, name);
+            if (format == .native_fp4_fp8 and (header.dtype == .i8 or header.dtype == .f8_e4m3)) {
+                const sn = try std.fmt.allocPrint(a, "{s}.scale", .{key});
+                const sh = c.headers.get(sn) orelse return error.MissingTensor;
+                m.native_kind = try storage.matrix(header, sh, key, k, n);
+                m.data = try upload(c, gpa, io, d, name);
+                errdefer m.data.free();
+                m.scale = try upload(c, gpa, io, d, sn);
+                m.convert_bf16 = std.mem.endsWith(u8, key, ".attn.wo_a");
+            } else {
+                if (format == .native_fp4_fp8 and (!storage.dense(key) or header.dtype != .bf16))
+                    return error.BadNativeWeight;
+                if (header.rank != 2 or header.shape[0] != n or header.shape[1] != k) return error.UnexpectedTensor;
+                m.dtype = try kind(header.dtype);
+                m.data = try upload(c, gpa, io, d, name);
+            }
         }
         errdefer m.free();
         const bname = try std.fmt.allocPrint(a, "{s}.bias", .{key});
@@ -134,10 +173,11 @@ pub const Matrix = struct {
         if (m.su) |*b| b.free();
         if (m.sv) |*b| b.free();
         if (m.bias) |*b| b.free();
+        if (m.scale) |*b| b.free();
         m.* = undefined;
     }
 
-    pub fn run(m: Matrix, exl3: cuda.dsv4_exl3.Projection, tensor: cuda.dsv4_tensor.Ops, stream: cuda.Stream, scratch: *Scratch, x: u64, y: u64, rows: u32, input: Kind, output: Kind) !void {
+    pub fn run(m: *Matrix, exl3: ?cuda.dsv4_exl3.Projection, native: ?cuda.dsv4_native.Ops, tensor: cuda.dsv4_tensor.Ops, stream: cuda.Stream, scratch: *Scratch, x: u64, y: u64, rows: u32, input: Kind, output: Kind) !void {
         if (rows == 0) return;
         if (input == .f16 or output == .f16) return error.UnsupportedActivationType;
         if (m.trellis_params) |p| {
@@ -147,8 +187,31 @@ pub const Matrix = struct {
             params.output_f32 = @intFromBool(output == .f32);
             const needed = try params.scratchBytes();
             try scratch.ensure(m.data.d, stream, needed.rotated, needed.sums);
-            try exl3.run(stream, params, x, m.data.ptr, m.su.?.ptr, m.sv.?.ptr, if (m.bias) |b| b.ptr else 0, y, scratch.rotated.?.ptr, scratch.sums.?.ptr);
+            try (exl3 orelse return error.MissingKernel).run(stream, params, x, m.data.ptr, m.su.?.ptr, m.sv.?.ptr, if (m.bias) |b| b.ptr else 0, y, scratch.rotated.?.ptr, scratch.sums.?.ptr);
+        } else if (m.native_kind) |q| {
+            const ops = native orelse return error.MissingKernel;
+            if (m.convert_bf16) {
+                try m.convertNative(ops, stream);
+                try tensor.dense(stream, x, m.data.ptr, if (m.bias) |b| b.ptr else 0, y, rows, m.k, m.n, input, m.dtype, output, false, 0);
+            } else {
+                const needed = try cuda.dsv4_native.Ops.scratchBytes(rows, m.k);
+                try scratch.ensure(m.data.d, stream, needed.quant, needed.scales);
+                try ops.run(stream, x, m.data.ptr, m.scale.?.ptr, if (m.bias) |b| b.ptr else 0, y, scratch.rotated.?.ptr, scratch.sums.?.ptr, rows, m.k, m.n, q == .fp4, input == .f32, output == .f32);
+            }
         } else try tensor.dense(stream, x, m.data.ptr, if (m.bias) |b| b.ptr else 0, y, rows, m.k, m.n, input, m.dtype, output, false, 0);
+    }
+
+    fn convertNative(m: *Matrix, ops: cuda.dsv4_native.Ops, stream: cuda.Stream) !void {
+        var converted = try Device.alloc(m.data.d, @as(usize, m.k) * m.n * 2);
+        errdefer converted.free();
+        try ops.toBf16(stream, m.data.ptr, m.scale.?.ptr, converted.ptr, m.k, m.n);
+        try stream.synchronize();
+        m.data.free();
+        m.scale.?.free();
+        m.data = converted;
+        m.scale = null;
+        m.native_kind = null;
+        m.dtype = .bf16;
     }
 };
 

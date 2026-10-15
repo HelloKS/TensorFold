@@ -18,6 +18,8 @@ const glue = &[_][]const u8{ "-O3", "--fmad=false", "--ftz=false", "--prec-div=t
 pub const kernels = [_]Kernel{
     .{ .name = "exl3", .flags = glue },
     .{ .name = "dsv4_ops", .flags = glue },
+    .{ .name = "dsv4_vision", .flags = glue },
+    .{ .name = "dsv4_native", .flags = glue },
     .{ .name = "dsv4_tensor", .flags = glue },
     .{ .name = "attn_train", .flags = &.{"-O3"} },
     .{ .name = "qwen27_train", .flags = &.{"-O3"} },
