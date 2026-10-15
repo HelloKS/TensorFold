@@ -86,6 +86,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     @import("h3_host.zig").library(b, target, optimize, h3_image);
     const cuda = runtime(b, target, optimize, if (nvcc != null or prebuilt != null) &images else &.{});
     const mods = family(b, target, optimize, cuda, draft_ids);
+    @import("dsv4_vision.zig").nativeTargets(b, target, mods.core, cuda);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip });
     cli.addImport("cuda", cuda);
     cli.addImport("core", mods.core);
@@ -265,6 +266,8 @@ pub fn hostTests(b: *std.Build, draft_ids: *std.Build.Module, build_options: *st
     const runtime_host = b.step("test-runtime-host", "Shared CUDA runtime and graph host regressions");
     runtime_host.dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cuda })).step);
     const mods = family(b, host, .debug, cuda, draft_ids);
+    @import("dsv4_vision.zig").tests(b, mods.core, cuda, step);
+    b.step("test-dsv4-cuda-host", "CUDA runtime and V4 launch contracts without GPU work").dependOn(&b.addRunArtifact(b.addTest(.{ .root_module = cuda })).step);
     @import("qwen_contract.zig").host(b, mods.core, step);
     @import("inc4_host.zig").round(b, cuda, mods.core);
     @import("inc4_host.zig").rows(b, cuda, mods.core);

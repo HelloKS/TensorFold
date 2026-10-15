@@ -1,0 +1,64 @@
+{
+  "date": "2026-10-16",
+  "upstream_commit": "c7137bb31a7dad924fb541a7068422127b9a94b2",
+  "model_reference": "6821d6ad3681a4b137b066b76094fa82ebd0a380",
+  "gpu": [
+    "NVIDIA GeForce RTX 5070 Ti, 617.14, 16303"
+  ],
+  "cuda_toolkit": "13.1",
+  "sass_built": [
+    120,
+    121
+  ],
+  "sass_executed": 120,
+  "compile_flags": [
+    "-O3",
+    "--fmad=false",
+    "--ftz=false",
+    "--prec-div=true",
+    "--prec-sqrt=true"
+  ],
+  "sources_sha256": {
+    "zig/kernels/cuda/exl3.cu": "c21fbff06da8f68e98cfe24215aaa5dc8060bf6d3c2d265a1d5dfdceb24507e6",
+    "zig/kernels/cuda/dsv4_ops.cu": "016047d561c185f8bfc74bcf64ce8448bb4261a6e43bd95e3abe42eeb3b1db99",
+    "zig/kernels/cuda/dsv4_tensor.cu": "f662cb723abe346e2f2680de910a7197f8ed8745ff8769d52db50b4f28bfa17e"
+  },
+  "results": {
+    "exl3": {
+      "codebook_states": 196608,
+      "projection_cases": 21,
+      "worst_abs_error": 3.775706417741276e-06,
+      "row_invariant": true,
+      "model_qualified": false
+    },
+    "model_ops": {
+      "checks": {
+        "routing": 2,
+        "sinkhorn": 2,
+        "quantization": 2,
+        "attention": 1,
+        "pooling_and_unfold": 2
+      },
+      "passed": 9,
+      "model_qualified": false
+    },
+    "tensor_ops": {
+      "checks": {
+        "dense": 12,
+        "embeddings": 2,
+        "vision_rotary": 1
+      },
+      "passed": 15,
+      "model_qualified": false
+    },
+    "images": {
+      "image_layout_patch_cases": 84,
+      "patches_bit_exact": true,
+      "jpeg_checked": true,
+      "model_qualified": false
+    }
+  },
+  "full_model_executed": false,
+  "dgx_spark_executed": false,
+  "serving_backend_complete": false
+}

@@ -1,6 +1,9 @@
 //! TensorFold's CUDA runtime: the driver, cuBLASLt and NCCL through dlopen, our kernels and Triton's, no Python.
 
 pub const abi = @import("abi.zig");
+pub const dsv4_exl3 = @import("dsv4_exl3.zig");
+pub const dsv4_ops = @import("dsv4_ops.zig");
+pub const dsv4_tensor = @import("dsv4_tensor.zig");
 pub const Driver = @import("driver.zig").Driver;
 pub const copy_source = @import("copy_source.zig");
 pub const completion = @import("completion.zig");
@@ -75,6 +78,8 @@ test {
     _ = gdn_train;
     _ = train_q4;
     _ = train_attn;
+    _ = dsv4_exl3;
+    _ = dsv4_ops;
     _ = @import("memory.zig");
     _ = memory_receipt;
     _ = @import("grouped.zig");

@@ -350,3 +350,28 @@ No external reference, captured cubin, model shard or CUDA compiler is bundled b
 
 The shared EXL3 resolver split and CUDA lane option forwarding retain work from PR #728 by @ajensenwaud,
 with the common EXL3 and DeepSeek contributor credits preserved.
+
+# DeepSeek-V4 Flash Vision development
+
+DeepSeek AI's `DeepSeek-V4-Flash-Vision-Exp` reference, revision
+`6821d6ad3681a4b137b066b76094fa82ebd0a380`, is MIT licensed. Its config,
+model semantics and image preprocessing are used by `zig/src/families/dsv4_vision/`.
+The original license is in `LICENSES/DeepSeek-V4-Flash-Vision-MIT.txt`.
+The EXL3 config fixture is from Turboderp's conversion, revision
+`1480a917a829ce4b1c6faa97a0d64195e9e05055`, under the model's MIT license.
+No weights are distributed in this repository.
+
+EXL3 decoding uses upstream TensorFold's scalar format specification, derived
+from Turboderp's MIT-licensed ExLlamaV3 format. Existing upstream notices apply.
+Bertholomus AI's Apache-2.0 V4.1 fork is a native integration reference, revision
+`dfc8fe50af303fcbdda0e839cae3a18eb53be2e1`; no V4.1 operators are represented as V4.
+MiaAI-Lab's AGPL-3.0 GLM deployment recipe is an operational reference only.
+No source from that recipe is included.
+
+`zig/src/families/dsv4_vision/png.zig` and `rgb.zig` selectively port the PNG
+decoder and RGB resampling/patchification from Bertholomus AI's `picture.zig`
+at that revision, under Apache-2.0. Copyright 2026 BertholomusAI (Albert Lee).
+The V4.1 grid and token layout were not ported. Pillow-compatible resampling
+retains its MIT-CMU notice in `LICENSES/Pillow-MIT-CMU.txt`.
+`jpeg.zig` calls the system libjpeg-turbo library through its public C API;
+no libjpeg-turbo implementation or binary is included in this repository.

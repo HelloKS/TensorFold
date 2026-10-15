@@ -1,5 +1,16 @@
 # TensorFold
 
+## DeepSeek-V4 Flash Vision source credits
+
+- [ashhart/TensorFold](https://github.com/ashhart/TensorFold), Apache-2.0: the upstream Zig engine, server, lane scheduler, CUDA runtime and EXL3 format implementation; based on commit `c7137bb31a7dad924fb541a7068422127b9a94b2`.
+- [DeepSeek AI / DeepSeek-V4-Flash-Vision-Exp](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp), MIT: model mathematics, image geometry, N-layout and prompt encoding reference, pinned to revision `6821d6ad3681a4b137b066b76094fa82ebd0a380`.
+- [Bertholomus AI / deepseek-v41-zig](https://github.com/bertholomus/TensorFold/tree/deepseek-v41-zig), Apache-2.0: the native PNG decoder and RGB resampling/patchification were selectively ported from `picture.zig`; EXL3 loading and TP2/vision integration were consulted at `dfc8fe50af303fcbdda0e839cae3a18eb53be2e1`.
+- [MiaAI-Lab / GLM-5.3-Flash-EXL3-2x-DGX-Sparks](https://github.com/MiaAI-Lab/GLM-5.3-Flash-EXL3-2x-DGX-Sparks), AGPL-3.0: operational reference for two DGX Sparks and performance measurement; no recipe source is incorporated.
+- [Turboderp / ExLlamaV3](https://github.com/turboderp-org/exllamav3), MIT: EXL3 format reference through upstream TensorFold. The [3.04bpw Vision-Exp checkpoint](https://huggingface.co/turboderp/DeepSeek-V4-Flash-Vision-Exp-exl3/tree/3.04bpw), revision `1480a917a829ce4b1c6faa97a0d64195e9e05055`, supplies the inspected storage contract; per-tensor widths also allow 4bpw conversions.
+- [Pillow](https://github.com/python-pillow/Pillow), MIT-CMU: image conversion/resampling semantics and the development-time pixel oracle. [libjpeg-turbo](https://github.com/libjpeg-turbo/libjpeg-turbo): the system TurboJPEG library supplies native JPEG decoding through its C API.
+
+DeepSeek-V4 Flash Vision work is under development. See [implementation and validation status](docs/recipes/deepseek-v4-flash-vision.md) before serving; these credits do not qualify a model or GPU.
+
 TensorFold serves language models from a Zig binary on Apple Silicon and NVIDIA GPUs.
 The engine reads checkpoints, tokenizes requests and runs Metal or CUDA kernels directly.
 Serving needs no Python or MLX installation.

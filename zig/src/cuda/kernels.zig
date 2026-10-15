@@ -11,6 +11,9 @@ fn Blob(comptime import_name: []const u8) type {
 
 /// False in host-only builds (no nvcc, no prebuilt fatbins); every image is then empty.
 pub const available = options.with_kernels;
+pub const exl3: []const u8 = if (available) &Blob("fatbin_exl3").bytes else &.{};
+pub const dsv4_ops: []const u8 = if (available) &Blob("fatbin_dsv4_ops").bytes else &.{};
+pub const dsv4_tensor: []const u8 = if (available) &Blob("fatbin_dsv4_tensor").bytes else &.{};
 
 pub const gdn: []const u8 = if (available) &Blob("fatbin_gdn").bytes else &.{};
 pub const flashnext_gdn: []const u8 = if (available) &Blob("fatbin_flashnext_gdn").bytes else &.{};
