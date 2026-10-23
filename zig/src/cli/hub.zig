@@ -6,9 +6,11 @@ const engines = @import("native_engines");
 pub const GiB: u64 = 1 << 30;
 
 /// One family the engine registry serves, with a display title.
-pub const Family = struct { model_type: []const u8, title: []const u8, formats: []const []const u8 };
+pub const Family = struct { model_type: []const u8, title: []const u8, formats: []const []const u8, format_note: ?[]const u8 = null };
 
-const titles = [_]struct { model_type: []const u8, title: []const u8 }{
+const titles = [_]struct { model_type: []const u8, title: []const u8, format_note: ?[]const u8 = null }{
+    .{ .model_type = "deepseek_v4", .title = "DeepSeek V4 Flash Vision (text TP2)",
+       .format_note = "format: original FP4/FP8 or EXL3; tf-dsv4-inspect --plan reports the validated storage and per-rank payload\n" },
     .{ .model_type = "nemotron_h", .title = "Nemotron 3.5 Lightning" },
     .{ .model_type = "nemotron_h_omni", .title = "Nemotron 3.5 Super VL" },
     .{ .model_type = "qwen4_exp", .title = "Qwen3.8 Flash Next" },
@@ -25,11 +27,13 @@ pub fn family(model_type: []const u8) ?Family {
     for (engines.families) |f| {
         if (!std.mem.eql(u8, f.model_type, model_type)) continue;
         var title: []const u8 = f.model_type;
+        var note: ?[]const u8 = null;
         for (titles) |t| if (std.mem.eql(u8, t.model_type, model_type)) {
             title = t.title;
+            note = t.format_note;
             break;
         };
-        return .{ .model_type = f.model_type, .title = title, .formats = f.formats };
+        return .{ .model_type = f.model_type, .title = title, .formats = f.formats, .format_note = note };
     }
     return null;
 }

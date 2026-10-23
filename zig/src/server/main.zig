@@ -121,7 +121,7 @@ pub fn main(init: std.process.Init) !u8 {
     var text_arena: std.heap.ArenaAllocator = .init(gpa); // the text's problem, written on its own thread
     defer text_arena.deinit();
     var text_problem: []const u8 = "";
-    const up = startup.both(io, loadText, .{ gpa, io, dir, args.chat_template, text_arena.allocator(), &text_problem }, engines.open, .{ a, gpa, io, dir, model_type, args, &problem }) catch |e| {
+    const up = startup.both(io, loadText, .{ gpa, io, dir, args.chat_template, engines.chat(model_type), text_arena.allocator(), &text_problem }, engines.open, .{ a, gpa, io, dir, model_type, args, &problem }) catch |e| {
         if (text_problem.len > 0) return fail(text_problem);
         if (problem.len > 0) return fail(problem); // an engine that failed after saying why
         return e;
@@ -159,8 +159,8 @@ fn forgetFail(env: *const std.process.Environ.Map) u32 {
 }
 
 /// HfText.load with every failure named in `problem`, so main tells the text's failure from the engine's.
-fn loadText(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, template: ?[]const u8, pa: std.mem.Allocator, problem: *[]const u8) !*hf_text.HfText {
-    return hf_text.HfText.load(gpa, io, dir, template, pa, problem) catch |e| {
+fn loadText(gpa: std.mem.Allocator, io: std.Io, dir: []const u8, template: ?[]const u8, chat: ?hf_text.Chat, pa: std.mem.Allocator, problem: *[]const u8) !*hf_text.HfText {
+    return hf_text.HfText.load(gpa, io, dir, template, chat, pa, problem) catch |e| {
         if (problem.len == 0) problem.* = @errorName(e);
         return e;
     };

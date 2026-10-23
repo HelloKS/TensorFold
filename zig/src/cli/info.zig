@@ -39,7 +39,9 @@ pub fn run(a: Allocator, io: std.Io, out: *std.Io.Writer, env: ?*const std.proce
     const flash_metal = @import("builtin").os.tag == .macos and std.mem.eql(u8, model_type, "qwen4_exp");
     const weights = if (flash_metal) try @import("flashnext_memory").weightBytes(checkpoint, a, io, dir) else try hub.sizeOf(a, io, dir);
     try out.print("family: {s} ({s})\n", .{ family.title, family.model_type });
-    if (hub.quantization(a, io, dir)) |q| {
+    if (family.format_note) |note| {
+        try out.writeAll(note);
+    } else if (hub.quantization(a, io, dir)) |q| {
         try out.print("format: {d}-bit, group {d}\n", .{ q.bits, q.group });
     } else {
         try out.print("format: full precision\n", .{});

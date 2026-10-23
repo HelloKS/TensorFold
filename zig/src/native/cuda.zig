@@ -25,7 +25,7 @@ const vision_offer = @import("cuda_vision_offer.zig");
 const drafted = @import("cuda_drafted.zig");
 const kv_pages = @import("cuda_kv_pool.zig");
 /// CUDA families provide metadata, open their lane backend and explain their refusals.
-const registry = .{ nemotron.native, nemotron.omni, glm.native, qwen35.native, qwen35.native_moe, flashnext.native, kolibri1.native };
+const registry = .{ nemotron.native, nemotron.omni, glm.native, qwen35.native, qwen35.native_moe, flashnext.native, kolibri1.native, @import("dsv4_vision") };
 /// --record opens here (engines.zig refuses it for a backend without this).
 pub const records = true;
 pub const backends: []const []const u8 = &.{"cuda"};
@@ -38,6 +38,7 @@ pub const families: []const api.Family = blk: {
     const final = out;
     break :blk &final;
 };
+pub const chat = @import("cuda_chat.zig").forRegistry(registry); // the server's probe for a family's own chat renderer
 const gib: f64 = 1 << 30;
 const cuda_device = @import("cuda_device.zig");
 pub const chip = cuda_device.chip;
@@ -171,7 +172,7 @@ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]c
     const report = platform.optional_libraries.atBoundary();
     defer report.deinit();
     if (@import("save_admission.zig").refused(io, o.dir, problem)) return null;
-    if (refusals.backend(o)) |why| {
+    if (refusals.backend(io, o)) |why| {
         problem.* = why;
         return null;
     }
@@ -336,7 +337,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
     const after = try pool(a, io, &g.ctx, problem) orelse return null;
     const L = @TypeOf(loaded); // a family's Loaded may leave out a learner and a lone driver
     const learn_bytes: usize = if (@hasField(L, "learn_bytes")) loaded.learn_bytes else 0;
-    const host_cache = try kv_pages.placeHost(F, a, loaded, o, after.room(model), @intCast(window), served.stream_bytes, problem) orelse return null;
+    const asked = if (@hasField(L, "max_lanes")) @min(o.lanes, loaded.max_lanes) else o.lanes; var q = o; q.lanes = asked; // a fixed-stream family serves at most its own cap, page arithmetic and all
+    const host_cache = try kv_pages.placeHost(F, a, loaded, q, after.room(model), @intCast(window), served.stream_bytes, problem) orelse return null;
     const host_budget = if (host_cache and @hasDecl(F, "snap_save")) budget.hostCacheBytes(a, io, o.prompt_cache_gib) else 0;
     var room = try @import("cuda_startup_costs.zig").room(a, served.prepare, try kv_pages.startupRoom(F, a, loaded, o, after.room(model), host_budget, problem) orelse return null, problem) orelse return null;
     var low: []const u8 = ""; // names the rank whose room bounds the streams, when it is not this one
@@ -344,14 +346,12 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
         room = pr.bytes;
         low = try std.fmt.allocPrint(a, " on rank {d}, the smallest room of the ranks", .{pr.rank});
     };
-    const free = loaded.free_streams;
-    const grow = budget.growRoom(room, !@hasField(F.Options, "lanes"));
-    const layout = kv_pages.layout(loaded);
+    const free = loaded.free_streams; const grow = budget.growRoom(room, !@hasField(F.Options, "lanes")); const layout = kv_pages.layout(loaded);
     var paged: ?kv_pages.Plan = null;
     const streams = if (layout) |l| blk: {
-        paged = try kv_pages.plan(F, a, l, room, o, @intCast(window), problem, host_cache) orelse return null;
+        paged = try kv_pages.plan(F, a, l, room, q, @intCast(window), problem, host_cache) orelse return null;
         break :blk paged.?.lanes;
-    } else budget.admit(grow, served.stream_bytes, free, o.lanes, o.lanes_fixed) catch |e| {
+    } else budget.admit(grow, served.stream_bytes, free, asked, o.lanes_fixed) catch |e| {
         problem.* = switch (e) {
             error.NoStream => try std.fmt.allocPrint(a, no_stream, .{
                 window,
@@ -362,8 +362,8 @@ fn openWith(comptime F: type, a: Allocator, gpa: Allocator, io: std.Io, o: api.O
                 low,
             }),
             error.TooMany => try std.fmt.allocPrint(a, too_many, .{
-                o.lanes,
-                toGib(served.stream_bytes * (o.lanes -| free)),
+                asked,
+                toGib(served.stream_bytes * (asked -| free)),
                 window,
                 toGib(room),
                 low,

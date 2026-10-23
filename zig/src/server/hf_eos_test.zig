@@ -10,7 +10,7 @@ test "EOS policy: HfText loads both declared EOS ids and missing generation neve
         var f = try fixture.Fixture.init(a, io, generation);
         defer f.deinit();
         var problem: []const u8 = "";
-        const t = try HfText.load(a, io, f.path, null, a, &problem);
+        const t = try HfText.load(a, io, f.path, null, null, a, &problem);
         defer t.deinit();
         try std.testing.expectEqualSlices(u32, if (generation != null) &.{ 127906, 127901 } else &.{127906}, t.text().eosIds());
     }
@@ -25,7 +25,7 @@ test "EOS policy: HfText names malformed generation and out-of-vocabulary EOS wi
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         var problem: []const u8 = "";
-        try std.testing.expectError(error.Load, HfText.load(a, io, f.path, null, arena.allocator(), &problem));
+        try std.testing.expectError(error.Load, HfText.load(a, io, f.path, null, null, arena.allocator(), &problem));
         try std.testing.expect(std.mem.indexOf(u8, problem, "EOS") != null);
     }
 }
@@ -40,7 +40,7 @@ test "EOS policy: HfText validates present model EOS and the model head bound as
         var arena = std.heap.ArenaAllocator.init(a);
         defer arena.deinit();
         var problem: []const u8 = "";
-        try std.testing.expectError(error.Load, HfText.load(a, io, f.path, null, arena.allocator(), &problem));
+        try std.testing.expectError(error.Load, HfText.load(a, io, f.path, null, null, arena.allocator(), &problem));
         try std.testing.expect(std.mem.indexOf(u8, problem, "EOS") != null);
     }
 }

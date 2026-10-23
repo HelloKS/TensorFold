@@ -31,6 +31,7 @@ pub fn load(w: *const u64) u64 {
 
 /// CLOCK_MONOTONIC in nanoseconds, the clock libmcdma-rpc waits on.
 pub fn nowNs() u64 {
+    if (builtin.os.tag == .windows) return @intCast(std.Io.Clock.awake.now(std.Options.debug_io).nanoseconds);
     var ts: platform.c.timespec = undefined;
     _ = platform.c.clock_gettime(platform.c.CLOCK.MONOTONIC, &ts);
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));
@@ -38,11 +39,16 @@ pub fn nowNs() u64 {
 
 /// Sleep about `ns` nanoseconds (the library's short step between polls).
 pub fn pause(ns: u64) void {
+    if (builtin.os.tag == .windows) {
+        std.Io.sleep(std.Options.debug_io, .fromNanoseconds(ns), .awake) catch {};
+        return;
+    }
     const ts: platform.c.timespec = .{ .sec = @intCast(ns / std.time.ns_per_s), .nsec = @intCast(ns % std.time.ns_per_s) };
     _ = platform.c.nanosleep(&ts, null);
 }
 
 pub fn checkedNowNs() error{ClockUnavailable}!u64 {
+    if (builtin.os.tag == .windows) return nowNs();
     var ts: platform.c.timespec = undefined;
     if (platform.c.clock_gettime(platform.c.CLOCK.MONOTONIC, &ts) != 0 or ts.sec < 0 or ts.nsec < 0 or ts.nsec >= std.time.ns_per_s) return error.ClockUnavailable;
     return @as(u64, @intCast(ts.sec)) * std.time.ns_per_s + @as(u64, @intCast(ts.nsec));

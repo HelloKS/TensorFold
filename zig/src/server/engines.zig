@@ -2,11 +2,19 @@
 const std = @import("std");
 const api = @import("engine_api");
 const native = @import("native_engines");
+const hf_text = @import("hf_text.zig");
 const cli = @import("cli.zig");
 const build_identity = @import("identity.zig");
 const Allocator = std.mem.Allocator;
 
 pub const Opened = api.Opened;
+
+/// The built-in family's chat source and renderer for a templateless ``model_type`` checkpoint (hf_text.load).
+pub fn chat(model_type: []const u8) ?hf_text.Chat {
+    if (comptime !@hasDecl(native, "chat")) return null; // Metal, HIP and the none backend ship no family chats
+    const c = native.chat.chatEncoder(model_type) orelse return null;
+    return .{ .source = c.source, .render = c.render };
+}
 
 /// The serve flags past the common ones the backend lists (tensor parallelism, MTP, kept entries, policy).
 pub const serves: []const []const u8 = if (@hasDecl(native, "serves")) native.serves else &.{};

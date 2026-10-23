@@ -7,11 +7,18 @@ const model_text = @import("model_text.zig");
 const Value = json.Value;
 const Allocator = std.mem.Allocator;
 
+/// A family's chat renderer for templateless checkpoints (native/cuda_chat.zig); every type here is std's.
+pub const Chat = struct {
+    source: []const u8,
+    render: *const fn (Allocator, []const u8, []const u8, bool, bool, ?[]const u8, *[]const u8, *[]u8, *[]const [2]usize) anyerror!void,
+};
+
 pub const HfText = struct {
     gpa: Allocator,
     arena: std.heap.ArenaAllocator,
     tok: tokenizer.Tokenizer,
     source: []const u8 = "",
+    chat: ?Chat = null,
     tool_source: []const u8 = "",
     compiled: ?template.Compiled = null,
     tool_compiled: ?template.Compiled = null,
@@ -21,7 +28,7 @@ pub const HfText = struct {
     suffix: []const u32 = &.{},
 
     /// Loads ``dir``'s tokenizer.json, chat template, special tokens and end-of-sequence ids; a failure's reason in `problem` (from `pa`).
-    pub fn load(gpa: Allocator, io: std.Io, dir: []const u8, template_override: ?[]const u8, pa: Allocator, problem: *[]const u8) !*HfText {
+    pub fn load(gpa: Allocator, io: std.Io, dir: []const u8, template_override: ?[]const u8, chat: ?Chat, pa: Allocator, problem: *[]const u8) !*HfText {
         const t = try gpa.create(HfText);
         errdefer gpa.destroy(t);
         t.* = .{ .gpa = gpa, .arena = .init(gpa), .tok = undefined };
@@ -49,6 +56,8 @@ pub const HfText = struct {
                 return error.Load;
             };
         } else try t.readTemplates(io, a, dir, config);
+        // a templateless checkpoint serves the built-in family's chat, if one claims its model_type (engines.zig)
+        if (template_override == null and t.source.len == 0) t.chat = chat;
         t.specials = try specialsOf(a, config);
         t.eos = t.eosIds(a, model_config, generation, config, t.tok.id_to_token.tokens.items.len) catch |e| {
             if (e == error.OutOfMemory) return e;
@@ -298,11 +307,27 @@ pub const HfText = struct {
 
     fn sourceFn(ctx: *anyopaque) []const u8 {
         const t = self(ctx);
+        if (t.chat) |c| return c.source;
         return if (t.tool_source.len > 0) std.mem.concat(t.arena.allocator(), u8, &.{ t.source, " ", t.tool_source }) catch t.source else t.source;
     }
 
     fn renderFn(ctx: *anyopaque, a: Allocator, messages: Value, options: model_text.RenderOptions, problem: *[]const u8) model_text.Error!model_text.Rendered {
         const t = self(ctx);
+        if (t.chat) |c| {
+            var mw: std.Io.Writer.Allocating = .init(a);
+            defer mw.deinit();
+            json.write(&mw.writer, messages, .{ .ascii = false }) catch return error.OutOfMemory;
+            var tw: std.Io.Writer.Allocating = .init(a);
+            defer tw.deinit();
+            if (options.tools) |tl| json.write(&tw.writer, tl, .{ .ascii = false }) catch return error.OutOfMemory;
+            var out_text: []u8 = &.{};
+            var out_spans: []const [2]usize = &.{};
+            c.render(a, mw.written(), tw.written(), options.add_generation_prompt, options.enable_thinking, options.reasoning_effort, problem, &out_text, &out_spans) catch |e| {
+                if (e == error.OutOfMemory) return error.OutOfMemory;
+                return error.Template;
+            };
+            return .{ .text = out_text, .spans = out_spans };
+        }
         const compiled = if (options.tools != null and t.tool_compiled != null) &t.tool_compiled.? else if (t.compiled) |*c| c else {
             problem.* = "this checkpoint has no chat template: send a completion prompt instead";
             return error.Template;
@@ -385,28 +410,28 @@ test "explicit template overrides checkpoint templates including tool prompts an
     const path = try std.fmt.allocPrint(a, "{s}/override.jinja", .{dir});
     var problem: []const u8 = "";
     const messages = (try json.parse(a, "[{\"role\":\"user\",\"content\":\"H\"}]")).ok;
-    const named = try HfText.load(gpa, io, dir, null, a, &problem);
+    const named = try HfText.load(gpa, io, dir, null, null, a, &problem);
     defer named.deinit();
     try std.testing.expectEqualStrings("defaultH", (try named.text().render(a, messages, .{}, &problem)).text);
     try std.testing.expectEqualStrings("toolsH", (try named.text().render(a, messages, .{ .tools = .{ .array = &.{} } }, &problem)).text);
     try tmp.dir.writeFile(io, .{ .sub_path = "override.jinja", .data = "override{{ messages[0].content }}" });
-    const tool_override = try HfText.load(gpa, io, dir, path, a, &problem);
+    const tool_override = try HfText.load(gpa, io, dir, path, null, a, &problem);
     defer tool_override.deinit();
     try std.testing.expectEqualStrings("overrideH", (try tool_override.text().render(a, messages, .{ .tools = .{ .array = &.{} } }, &problem)).text);
     try tmp.dir.writeFile(io, .{ .sub_path = "chat_template.jinja", .data = "sidecar{{ messages[0].content }}" });
-    const sidecar = try HfText.load(gpa, io, dir, null, a, &problem);
+    const sidecar = try HfText.load(gpa, io, dir, null, null, a, &problem);
     defer sidecar.deinit();
     try std.testing.expectEqualStrings("sidecarH", (try sidecar.text().render(a, messages, .{}, &problem)).text);
-    const overridden = try HfText.load(gpa, io, dir, path, a, &problem);
+    const overridden = try HfText.load(gpa, io, dir, path, null, a, &problem);
     defer overridden.deinit();
     for ([_]model_text.RenderOptions{ .{}, .{ .tools = .{ .array = &.{} } } }) |options|
         try std.testing.expectEqualStrings("overrideH", (try overridden.text().render(a, messages, options, &problem)).text);
     const missing = try std.fmt.allocPrint(a, "{s}/missing.jinja", .{dir});
-    try std.testing.expectError(error.Load, HfText.load(gpa, io, dir, missing, a, &problem));
+    try std.testing.expectError(error.Load, HfText.load(gpa, io, dir, missing, null, a, &problem));
     try tmp.dir.writeFile(io, .{ .sub_path = "override.jinja", .data = "{% unknown %}" });
-    try std.testing.expectError(error.Load, HfText.load(gpa, io, dir, path, a, &problem));
+    try std.testing.expectError(error.Load, HfText.load(gpa, io, dir, path, null, a, &problem));
     try tmp.dir.writeFile(io, .{ .sub_path = "override.jinja", .data = "" });
-    const empty = try HfText.load(gpa, io, dir, path, a, &problem);
+    const empty = try HfText.load(gpa, io, dir, path, null, a, &problem);
     defer empty.deinit();
     try std.testing.expectError(error.Template, empty.text().render(a, messages, .{}, &problem));
 }

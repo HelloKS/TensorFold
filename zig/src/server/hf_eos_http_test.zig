@@ -74,7 +74,7 @@ fn check(first: u32, declared: bool, ignore: bool, streaming: bool, leading: boo
     var f = try fixture.Fixture.init(gpa, io, if (declared) fixture.generation else null);
     defer f.deinit();
     var problem: []const u8 = "";
-    const text = try HfText.load(gpa, io, f.path, null, a, &problem);
+    const text = try HfText.load(gpa, io, f.path, null, null, a, &problem);
     defer text.deinit();
     const ids = if (leading) [_]u32{ 1, first, 2 } else [_]u32{ first, 1, 2 };
     var script = Script{ .a = a, .ids = &ids };

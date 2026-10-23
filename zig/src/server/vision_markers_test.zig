@@ -64,7 +64,7 @@ test "vision markers: plain vocabulary entries cannot become image or video mark
     }
     try fixture.tmp.dir.writeFile(t.io, .{ .sub_path = "tokenizer.json", .data = try std.json.Stringify.valueAlloc(a, table, .{}) });
     var problem: []const u8 = "";
-    const hf = try hf_text.HfText.load(a, t.io, fixture.path, null, a, &problem);
+    const hf = try hf_text.HfText.load(a, t.io, fixture.path, null, null, a, &problem);
     defer hf.deinit();
     const text = hf.text();
     const image = text.tokenId("<|image|>").?;

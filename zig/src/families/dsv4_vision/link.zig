@@ -1,0 +1,142 @@
+//! Length-prefixed TP2 control frames over a persistent TCP connection with bounded reads.
+
+// Copyright 2026 BertholomusAI (Albert Lee). Apache-2.0; adapted from dsv41/link.zig.
+
+const std = @import("std");
+const c = std.c;
+
+pub const Link = struct {
+    fd: c.fd_t,
+
+    fn socket() !c.fd_t {
+        const fd = c.socket(c.AF.INET, c.SOCK.STREAM, 0);
+        if (fd < 0) return error.SocketFailed;
+        tune(fd);
+        return fd;
+    }
+
+    // Bound socket waits; control traffic stays on the model's persistent TCP connection.
+    fn tune(fd: c.fd_t) void {
+        const one: c_int = 1;
+        const timeout: c.timeval = .{ .sec = 120, .usec = 0 };
+        _ = c.setsockopt(fd, c.IPPROTO.TCP, std.posix.TCP.NODELAY, std.mem.asBytes(&one), @sizeOf(c_int));
+        _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.RCVTIMEO, std.mem.asBytes(&timeout), @sizeOf(c.timeval));
+        _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.SNDTIMEO, std.mem.asBytes(&timeout), @sizeOf(c.timeval));
+    }
+
+    fn addr(ip: [4]u8, port: u16) c.sockaddr.in {
+        return .{ .port = std.mem.nativeToBig(u16, port), .addr = @bitCast(ip) };
+    }
+
+    /// Rank 0: listen on `ip`:`port` and take the one peer's connection.
+    pub fn listen(ip: [4]u8, port: u16) !Link {
+        const fd = try socket();
+        errdefer _ = c.close(fd);
+        const one: c_int = 1;
+        _ = c.setsockopt(fd, c.SOL.SOCKET, c.SO.REUSEADDR, std.mem.asBytes(&one), @sizeOf(c_int));
+        var a = addr(ip, port);
+        if (c.bind(fd, @ptrCast(&a), @sizeOf(c.sockaddr.in)) != 0) return error.BindFailed;
+        if (c.listen(fd, 1) != 0) return error.ListenFailed;
+        const peer = c.accept(fd, null, null);
+        if (peer < 0) return error.AcceptFailed;
+        _ = c.close(fd);
+        tune(peer);
+        return .{ .fd = peer };
+    }
+
+    /// Rank 1: connect to rank 0, retrying for up to `seconds` while it starts.
+    pub fn connect(io: std.Io, ip: [4]u8, port: u16, seconds: u32) !Link {
+        var tries: u32 = 0;
+        while (true) : (tries += 1) {
+            const fd = try socket();
+            var a = addr(ip, port);
+            if (c.connect(fd, @ptrCast(&a), @sizeOf(c.sockaddr.in)) == 0) return .{ .fd = fd };
+            _ = c.close(fd);
+            if (tries >= seconds * 4) return error.ConnectFailed;
+            std.Io.sleep(io, .fromMilliseconds(250), .awake) catch {};
+        }
+    }
+
+    pub fn close(l: *Link) void {
+        _ = c.close(l.fd);
+        l.* = undefined;
+    }
+    pub fn shutdown(l: Link) void {
+        _ = c.shutdown(l.fd, c.SHUT.RDWR);
+    }
+
+    fn writeAll(l: Link, bytes: []const u8) !void {
+        var done: usize = 0;
+        while (done < bytes.len) {
+            const n = c.send(l.fd, bytes.ptr + done, bytes.len - done, c.MSG.NOSIGNAL);
+            if (n <= 0) {
+                if (n < 0 and c.errno(n) == .INTR) continue;
+                return error.PeerDown;
+            }
+            done += @intCast(n);
+        }
+    }
+
+    fn readAll(l: Link, out: []u8) !void {
+        var done: usize = 0;
+        while (done < out.len) {
+            const n = c.recv(l.fd, out.ptr + done, out.len - done, 0);
+            if (n <= 0) {
+                if (n < 0 and c.errno(n) == .INTR) continue;
+                return error.PeerDown;
+            }
+            done += @intCast(n);
+        }
+    }
+
+    /// One frame: its length (u32, little-endian), then its bytes.
+    pub fn send(l: Link, bytes: []const u8) !void {
+        var len: [4]u8 = undefined;
+        std.mem.writeInt(u32, &len, @intCast(bytes.len), .little);
+        try l.writeAll(&len);
+        try l.writeAll(bytes);
+    }
+
+    /// The next frame into `buf` (a frame longer than `buf` is refused); its bytes.
+    pub fn recv(l: Link, buf: []u8) ![]u8 {
+        var len: [4]u8 = undefined;
+        try l.readAll(&len);
+        const n = std.mem.readInt(u32, &len, .little);
+        if (n > buf.len) return error.FrameTooLong;
+        try l.readAll(buf[0..n]);
+        return buf[0..n];
+    }
+
+    // Idle workers may wait for a new request; partial command frames still have the socket deadline.
+    pub fn recvIdle(l: Link, buf: []u8) ![]u8 {
+        var len: [4]u8 = undefined;
+        while (true) {
+            const n = c.recv(l.fd, &len, 1, 0);
+            if (n == 1) break;
+            if (n == 0) return error.PeerDown;
+            switch (c.errno(n)) {
+                .AGAIN, .INTR => continue,
+                else => return error.PeerDown,
+            }
+        }
+        try l.readAll(len[1..]);
+        const n = std.mem.readInt(u32, &len, .little);
+        if (n > buf.len) return error.FrameTooLong;
+        try l.readAll(buf[0..n]);
+        return buf[0..n];
+    }
+};
+
+/// "192.0.2.7" as four bytes.
+pub fn parseIp(text: []const u8) ![4]u8 {
+    var out: [4]u8 = undefined;
+    var it = std.mem.splitScalar(u8, text, '.');
+    for (&out) |*b| b.* = try std.fmt.parseInt(u8, it.next() orelse return error.BadAddress, 10);
+    if (it.next() != null) return error.BadAddress;
+    return out;
+}
+
+test "addresses parse as four bytes" {
+    try std.testing.expectEqual([4]u8{ 192, 0, 2, 7 }, try parseIp("192.0.2.7"));
+    try std.testing.expectError(error.BadAddress, parseIp("192.0.2"));
+}

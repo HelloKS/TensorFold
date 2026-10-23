@@ -6,23 +6,8 @@ const catalog = @import("cuda_kernels.zig");
 pub const Kernel = catalog.Kernel;
 pub const kernels = catalog.kernels;
 
-fn stagger(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
-    return b.createModule(.{ .root_source_file = b.path("zig/src/core/stagger.zig"), .target = target, .optimize = optimize });
-}
-
-/// The runtime module for `target`; `with_kernels` false builds it host-only (empty images).
-pub fn runtime(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, images: []const ?std.Build.LazyPath) *std.Build.Module {
-    const options = b.addOptions();
-    var with = images.len > 0;
-    for (images) |i| with = with and i != null;
-    options.addOption(bool, "with_kernels", with);
-    const cuda = b.createModule(.{ .root_source_file = b.path("zig/src/cuda/root.zig"), .target = target, .optimize = optimize, .link_libc = true });
-    cuda.addImport("gpu_memory", @import("gpu_memory.zig").module(b, target));
-    cuda.addOptions("kernel_options", options);
-    cuda.addImport("stagger", stagger(b, target, optimize));
-    if (with) for (kernels, images) |k, image| cuda.addAnonymousImport(b.fmt("fatbin_{s}", .{k.name}), .{ .root_source_file = image.? });
-    return cuda;
-}
+pub const runtime = @import("cuda_runtime.zig").runtime;
+const stagger = @import("cuda_runtime.zig").stagger;
 
 fn family(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, draft_ids: *std.Build.Module) struct { core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, qwen35: *std.Build.Module, qwen_vision: *std.Build.Module, tokenizer: *std.Build.Module, heat: *std.Build.Module, radio: *std.Build.Module, living: *std.Build.Module } {
     const tokenizer = b.createModule(.{ .root_source_file = b.path("zig/src/core/tokenizer/tokenizer.zig"), .target = target, .optimize = optimize, .link_libc = true });
@@ -86,7 +71,7 @@ pub fn targets(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     @import("h3_host.zig").library(b, target, optimize, h3_image);
     const cuda = runtime(b, target, optimize, if (nvcc != null or prebuilt != null) &images else &.{});
     const mods = family(b, target, optimize, cuda, draft_ids);
-    @import("dsv4_vision.zig").nativeTargets(b, target, mods.core, cuda);
+    @import("dsv4_vision.zig").nativeTargets(b, target, mods.core, cuda, mods.lanes);
     const cli = b.createModule(.{ .root_source_file = b.path("zig/src/cli/cuda_main.zig"), .target = target, .optimize = optimize, .link_libc = true, .strip = strip });
     cli.addImport("cuda", cuda);
     cli.addImport("core", mods.core);
@@ -189,8 +174,16 @@ fn flashnextModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: st
 }
 
 /// The CUDA engines a native server opens (native/cuda.zig), over the given runtime and families.
-fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, heat: *std.Build.Module, qwen35: *std.Build.Module, qwen_vision: *std.Build.Module) struct { api: *std.Build.Module, engines: *std.Build.Module } {
+fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, cuda: *std.Build.Module, core: *std.Build.Module, lanes: *std.Build.Module, nemotron: *std.Build.Module, heat: *std.Build.Module, qwen35: *std.Build.Module, qwen_vision: *std.Build.Module) struct { api: *std.Build.Module, engines: *std.Build.Module, json: *std.Build.Module } {
     const api = b.createModule(.{ .root_source_file = b.path("zig/src/core/engine_api.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
+    const cluster_backend = b.createModule(.{ .root_source_file = b.path("zig/src/cluster/backend.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
+    // the cluster owns canon's math; a file belongs to one module, so GLM reaches it through the cluster backend
+    const canon_alias = b.addWriteFiles().add("dsv4_canon_alias.zig", "pub const Range = @import(\"cluster_backend\").canon.Range;\n" ++
+        "pub const partition = @import(\"cluster_backend\").canon.partition;\n");
+    const glm = glmCuda(b, target, optimize, cuda, core, lanes, heat);
+    glm.addImport("canon", b.createModule(.{ .root_source_file = canon_alias, .target = target, .optimize = optimize, .imports = &.{.{ .name = "cluster_backend", .module = cluster_backend }} }));
+    const family_json = @import("server.zig").json(b, target, optimize); // the one JSON module the server root and the family share (nativeServer)
+    const dsv4_vision = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv4_vision/native.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "core", .module = core }, .{ .name = "cuda", .module = cuda }, .{ .name = "lanes", .module = lanes }, .{ .name = "cluster_backend", .module = cluster_backend }, .{ .name = "json", .module = family_json } } });
     const mod = b.createModule(.{
         .root_source_file = b.path("zig/src/native/cuda.zig"),
         .target = target,
@@ -205,12 +198,13 @@ fn engines(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builti
             .{ .name = "lfm2", .module = lfm2Module(b, target, optimize, cuda, core) },
             .{ .name = "core", .module = core },
             .{ .name = "flashnext", .module = flashnextModule(b, target, optimize, cuda, core, lanes, qwen_vision) },
-            .{ .name = "glm_cuda", .module = glmCuda(b, target, optimize, cuda, core, lanes, heat) },
+            .{ .name = "glm_cuda", .module = glm },
             .{ .name = "qwen35", .module = qwen35 },
             .{ .name = "kolibri1", .module = kolibri1Module(b, target, optimize, cuda, core, lanes) },
         },
     });
-    return .{ .api = api, .engines = mod };
+    mod.addImport("dsv4_vision", dsv4_vision);
+    return .{ .api = api, .engines = mod, .json = family_json };
 }
 
 /// The checkpoint subcommands' module: `models`, `info` and `pull` over the CUDA families.
@@ -231,7 +225,7 @@ fn nativeServer(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.b
         .imports = &.{ .{ .name = "core", .module = core }, .{ .name = "engine_api", .module = m.api }, .{ .name = "tokenizer", .module = tokenizer }, .{ .name = "template", .module = template }, .{ .name = "native_engines", .module = m.engines }, .{ .name = "living", .module = living }, .{ .name = "checkpoint_cli", .module = checkpointCli(b, target, .ReleaseSafe, null, m.engines, core) } },
     }) });
     exe.root_module.addOptions("build_options", build_options);
-    _ = @import("server.zig").addTo(b, exe.root_module, target, .ReleaseSafe);
+    _ = @import("server.zig").addToWithJson(b, exe.root_module, target, .ReleaseSafe, m.json);
     if (!install_native) {
         exe.root_module.strip = true;
         return exe;

@@ -1,13 +1,18 @@
 TensorFold
 
 DeepSeek-V4-Flash-Vision-Exp development changes (2026)
-This fork is based on ashhart/TensorFold c7137bb31a7dad924fb541a7068422127b9a94b2.
 Added the dsv4_vision model contract, image layout, validation and operator work.
 Added native FP4/FP8 loading, physical TP2 slices and the ViT/aligner graph.
-Modified build integration and added source credits near the start of README.md.
+Modified build integration and added the model's row to the README model table.
 DeepSeek's MIT reference was used for model semantics and image preprocessing;
 the license is retained in LICENSES/DeepSeek-V4-Flash-Vision-MIT.txt.
-The Bertholomus AI V4.1 fork was consulted for native integration design.
+The Bertholomus AI V4.1 fork supplies selectively adapted TCP/NCCL control code
+and the lane/server adapter pattern (dfc8fe50af303fcbdda0e839cae3a18eb53be2e1).
+Copyright 2026 BertholomusAI (Albert Lee), Apache-2.0.
+Added a text TP2 reference graph, rank worker and native server registration.
+DeepSeek encoding_dsv4.py supplies adapted chat, reasoning, DSML and image encoding.
+DeepSeek model.py supplies DSpark stage, target-tap, Markov and confidence semantics.
+Distributed snapshots and HTTP vision extend TensorFold's existing cache and lane APIs.
 The MiaAI-Lab GLM recipe was consulted for operations only; no AGPL source copied.
 Detailed sources and implementation status: docs/recipes/deepseek-v4-flash-vision.md.
 

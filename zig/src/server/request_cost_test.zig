@@ -53,7 +53,7 @@ test "request provenance: 400 KiB and 1000 spellings have bounded mask work and 
     defer fixture.deinit();
     try table(a, &fixture);
     var problem: []const u8 = "";
-    const hf = try HfText.load(a, t.io, fixture.path, null, a, &problem);
+    const hf = try HfText.load(a, t.io, fixture.path, null, null, a, &problem);
     defer hf.deinit();
     try t.expectEqual(@as(usize, 1000), hf.tok.added.len);
     const input = try a.alloc(u8, 400 * 1024);

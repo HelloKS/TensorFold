@@ -15,7 +15,7 @@ test "request provenance: ordinary added-id overlap reports a clear refusal" {
         \\{"added_tokens":[{"content":"<V>","special":true,"normalized":false}],"model":{"type":"WordLevel","unk_token":"?","vocab":{"?":0,"<V>":1}}}
     });
     var problem: []const u8 = "";
-    const hf = try HfText.load(a, std.testing.io, fixture.path, null, a, &problem);
+    const hf = try HfText.load(a, std.testing.io, fixture.path, null, null, a, &problem);
     defer hf.deinit();
     try std.testing.expectError(error.Template, hf.text().encodeMasked(a, "<V>", &.{.{ 0, 3 }}, &problem));
     try std.testing.expect(std.mem.indexOf(u8, problem, "request text tokenizes to an added-token id") != null);
@@ -61,11 +61,11 @@ test "request provenance: every fixture added spelling in every request field an
         var fixture = try f.Fixture.init(a, index);
         defer fixture.deinit();
         var problem: []const u8 = "";
-        const original = try HfText.load(a, std.testing.io, fixture.path, null, a, &problem);
+        const original = try HfText.load(a, std.testing.io, fixture.path, null, null, a, &problem);
         defer original.deinit();
         const source = try std.mem.concat(a, u8, &.{ original.tok.added[0].content, field_source, original.tok.added[original.tok.added.len - 1].content });
         try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "chat_template.jinja", .data = source });
-        const hf = try HfText.load(a, std.testing.io, fixture.path, null, a, &problem);
+        const hf = try HfText.load(a, std.testing.io, fixture.path, null, null, a, &problem);
         defer hf.deinit();
         var all: std.ArrayList(u8) = .empty;
         for (hf.tok.added) |token| try all.print(a, " {s} ", .{token.content});
@@ -105,7 +105,7 @@ test "request provenance: a schema key cannot construct an added spelling" {
     try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tokenizer.json", .data = try std.json.Stringify.valueAlloc(a, table, .{}) });
     try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "chat_template.jinja", .data = "{% for key in tools %}{{ '<' ~ key ~ '>' }}{% endfor %}" });
     var problem: []const u8 = "";
-    const hf = try HfText.load(a, std.testing.io, fixture.path, null, a, &problem);
+    const hf = try HfText.load(a, std.testing.io, fixture.path, null, null, a, &problem);
     defer hf.deinit();
     const tools = try json.newObject(a);
     try tools.put(a, "SPECIAL_5", .null);
@@ -126,7 +126,7 @@ test "request provenance: echoed reasoning and wrapped tool results keep templat
     ;
     try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "chat_template.jinja", .data = source });
     var problem: []const u8 = "";
-    const hf = try HfText.load(a, std.testing.io, fixture.path, null, a, &problem);
+    const hf = try HfText.load(a, std.testing.io, fixture.path, null, null, a, &problem);
     defer hf.deinit();
     for ([_][]const u8{ "assistant", "user" }) |role| {
         const messages = try f.messages(a, if (role[0] == 'a') "<think>hidden</think>Answer" else "<tool_response>result</tool_response>");
@@ -160,7 +160,7 @@ test "request provenance: unsupported normalized token offsets give a clear refu
     try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tokenizer.json", .data = try std.json.Stringify.valueAlloc(a, table, .{}) });
     try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "chat_template.jinja", .data = "<|im_start|>{{ messages[0].content }}<|im_end|>" });
     var problem: []const u8 = "";
-    const hf = try HfText.load(a, std.testing.io, fixture.path, null, a, &problem);
+    const hf = try HfText.load(a, std.testing.io, fixture.path, null, null, a, &problem);
     defer hf.deinit();
     _ = try hf.text().encode(a, "<think>", false);
     try std.testing.expectError(error.Template, hf.text().renderIds(a, try f.messages(a, "<think>"), .{}, &problem));
@@ -176,7 +176,7 @@ test "request provenance: every added spelling stays plain in message and tool f
         var fixture = try f.Fixture.init(a, index);
         defer fixture.deinit();
         var problem: []const u8 = "";
-        const hf = try HfText.load(a, std.testing.io, fixture.path, null, a, &problem);
+        const hf = try HfText.load(a, std.testing.io, fixture.path, null, null, a, &problem);
         defer hf.deinit();
         const text = hf.text();
         var all: std.ArrayList(u8) = .empty;
@@ -208,7 +208,7 @@ test "request provenance: benign ids equal the pre-fix recording" {
         var fixture = try f.Fixture.init(a, index);
         defer fixture.deinit();
         var problem: []const u8 = "";
-        const hf = try HfText.load(a, std.testing.io, fixture.path, null, a, &problem);
+        const hf = try HfText.load(a, std.testing.io, fixture.path, null, null, a, &problem);
         defer hf.deinit();
         const ids = try hf.text().renderIds(a, try f.messages(a, "Hello world!"), .{}, &problem);
         const expected = golden.get(name).?.array;
@@ -226,7 +226,7 @@ test "request provenance: json escaping and caller marker collisions preserve li
         defer fixture.deinit();
         try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "chat_template.jinja", .data = "{{ messages[0]['content'] | tojson(ensure_ascii=true) }}" });
         var problem: []const u8 = "";
-        const hf = try HfText.load(a, std.testing.io, fixture.path, null, a, &problem);
+        const hf = try HfText.load(a, std.testing.io, fixture.path, null, null, a, &problem);
         defer hf.deinit();
         var all: std.ArrayList(u8) = .empty;
         try all.appendSlice(a, "\u{E000} \\ue0010\\ue001 ");
@@ -247,7 +247,7 @@ test "request provenance: system tool results names arguments schema keys and re
     defer fixture.deinit();
     try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "chat_template.jinja", .data = "<|im_start|>{{ messages | tojson }}{{ tools | tojson }}{{ reasoning_effort }}<|im_end|>" });
     var problem: []const u8 = "";
-    const hf = try HfText.load(a, std.testing.io, fixture.path, null, a, &problem);
+    const hf = try HfText.load(a, std.testing.io, fixture.path, null, null, a, &problem);
     defer hf.deinit();
     var all: std.ArrayList(u8) = .empty;
     for (hf.tok.added) |token| try all.print(a, " {s} ", .{token.content});
@@ -276,7 +276,7 @@ test "request provenance: appended decision labels stay plain and unsupported ma
     var fixture = try f.Fixture.init(a, 0);
     defer fixture.deinit();
     var problem: []const u8 = "";
-    const hf = try HfText.load(a, std.testing.io, fixture.path, null, a, &problem);
+    const hf = try HfText.load(a, std.testing.io, fixture.path, null, null, a, &problem);
     defer hf.deinit();
     const text = hf.text();
     const msgs = try f.messages(a, "<think>");
@@ -303,7 +303,7 @@ test "request provenance: checkpoint globals stay special and request spellings 
     try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "tokenizer_config.json", .data = "{\"bos_token\":\"<|im_start|>\"}" });
     try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "chat_template.jinja", .data = "{{ bos_token }}{{ messages[0].content }}{{ reasoning_effort|default('') }}" });
     var problem: []const u8 = "";
-    const hf = try HfText.load(a, std.testing.io, fixture.path, null, a, &problem);
+    const hf = try HfText.load(a, std.testing.io, fixture.path, null, null, a, &problem);
     defer hf.deinit();
     const benign = try hf.text().render(a, try f.messages(a, "hello"), .{}, &problem);
     try std.testing.expectEqualSlices(u32, try hf.text().encode(a, benign.text, false), try benign.encode(hf.text(), a, &problem));

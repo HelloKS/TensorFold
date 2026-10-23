@@ -2,10 +2,12 @@
 
 This branch adds native building blocks for DeepSeek-V4-Flash-Vision-Exp on two
 DGX Sparks, loading either the original FP4/FP8 or EXL3 checkpoint.
-**It does not yet provide an end-to-end serving backend for either format.** The CUDA
-server's family registry has not been extended to advertise this model. An
-offline storage check, a successful projection probe or synthetic GPU checks
-must not be reported as a qualified text/vision server.
+An experimental native **text/vision TP=2** server and rank-1 worker are now wired
+into the existing CUDA registry and lane scheduler. See
+[two-Spark build and launch instructions](deepseek-v4-text-tp2.md).
+DSpark, distributed prefix snapshots and HTTP vision are connected. The complete
+checkpoint has not been served on two Sparks here; local operator or vision-probe
+results do not qualify the complete text/vision server.
 
 The intended serving profile is 262,144 prompt-plus-output tokens per request,
 four concurrent active requests, DSpark, prefix caching, streaming and tool
@@ -17,7 +19,7 @@ serving validation on the two Sparks.
 
 | Input | Revision | Usage |
 | --- | --- | --- |
-| [TensorFold upstream](https://github.com/ashhart/TensorFold) | `c7137bb31a7dad924fb541a7068422127b9a94b2` | Base engine and server |
+| [TensorFold upstream](https://github.com/ashhart/TensorFold) | `f4d6c4f2` (rebased from `c7137bb3`) | Base engine and server |
 | [Official Vision-Exp model](https://huggingface.co/deepseek-ai/DeepSeek-V4-Flash-Vision-Exp) | `6821d6ad3681a4b137b066b76094fa82ebd0a380` | Model semantics and image oracle |
 | [Turboderp EXL3, 3.04bpw](https://huggingface.co/turboderp/DeepSeek-V4-Flash-Vision-Exp-exl3/tree/3.04bpw) | `1480a917a829ce4b1c6faa97a0d64195e9e05055` | Inspected storage layout |
 | [Bertholomus V4.1 branch](https://github.com/bertholomus/TensorFold/tree/deepseek-v41-zig) | `dfc8fe50af303fcbdda0e839cae3a18eb53be2e1` | Selective PNG/RGB port and integration reference |
@@ -55,21 +57,32 @@ those original tensors.
 - TP2 partition rules and a lossless rank-cache writer with source/payload
   SHA256 hashes. The native reader verifies schema, config, payload and local
   tensor shapes. Vision weights are stored on rank 0 only.
-- Media-aware cache-key and snapshot-boundary helpers. These helpers are not
-  yet wired into the engine's prefix cache.
+- Media-aware HTTP input, positioned image rows and two-rank prefix snapshots.
+  Aligner outputs share the prefix-cache budget; snapshots never cut image spans.
 
-## Remaining integration
+## Serving integration and remaining qualification
 
-The text model forward, incremental compressed attention/indexer state,
-two-rank command/NCCL execution and the layer graph remain to be connected.
-DSpark verification/rollback, shared lane rounds, prefix snapshot save/restore,
-image-bearing HTTP requests and capability/CLI registration also remain.
-The vision span path is not connected to HTTP or text prefill. Two-Spark
-vision validation remains open. CUDA Graph, native Tensor Core
-GEMM optimizations and RDMA optimizations are not enabled.
+Text prefill/decode, DSpark target taps and three draft stages, two-rank
+transactional snapshots and PNG/JPEG HTTP input are connected to the existing
+lane scheduler. Image spans prefill by layer with bidirectional visibility
+inside each image; text and compressor/indexer queries retain their original
+causal rules. Vision runs on rank zero and sends BF16 embedding spans to rank one.
 
-No `serve` command is documented for this model until those paths exist. The
-provided probes are development tools, not replacements for an engine.
+DSpark proposals are currently greedy. Markov and confidence heads execute,
+but confidence does not change the acceptance rule. The shared lane core
+checks every proposal against its own target draw, including seeded sampling.
+`TF_DSV4_DSPARK=1` explicitly enables this unqualified path; `--no-drafts`
+and a request's `"draft": false` select plain decoding.
+
+Local evidence covers state byte equality after rejection/partial acceptance,
+slot transfer/reset and bounded image-cache reuse on an RTX 5070 Ti, plus host
+protocol and HTTP regressions. It does **not** qualify real-checkpoint text or
+DSpark logits, complete image-to-answer fidelity, two-Spark NCCL execution,
+256K × 4 admission, cancellation under real peer failure or served throughput.
+CUDA Graphs, fused batched execution and transport optimizations await that evidence.
+
+See [two-Spark serving and hardware qualification](deepseek-v4-text-tp2.md).
+Historical receipts below describe their recorded source state only.
 
 ## Build and inspect
 
@@ -302,10 +315,10 @@ Their maximum errors fall from 0.499569 to 0.000431 (QK) and from 0.007691 to
 0.000121 (PV). All 12 vision operator checks and 15 tensor checks pass.
 These local original-weight results do not qualify EXL3 vision or DGX Spark.
 
-The remaining delivery gates are the complete text/DSpark graph, NCCL rank
-execution, core lane/prefix-cache/API integration, full-model numerical checks
-and the user's two-Spark 256K/four-active-request serving qualification. No
-throughput or memory-fit result for that profile has been measured here.
+Those receipts predate the DSpark, distributed prefix snapshots and vision
+API integration now implemented. Real NCCL execution, full-model numerical checks
+and the user's two-Spark 256K/four-active-request qualification remain unrun.
+No throughput or memory-fit result for that profile has been measured here.
 
 The local PNG and JPEG integration check runs the complete vision graph twice
 per image, once from patches and once through `--image`, and requires exact
@@ -336,8 +349,8 @@ hashes and the unchanged qualification limits. The
 [initial vision failure](../../tools/dsv4-vision/receipts/2026-10-16-native-vision-before.json)
 is retained for the normalization comparison.
 
-The final host run covers 29 family contract tests and 43 CUDA-runtime tests.
+The 2026-10-16 host run covered 29 family contract tests and 43 CUDA-runtime tests.
 `check-dsv4-target -Dtarget=aarch64-linux-gnu` also cross-compiles the complete
 family contract test executable; it does not run that executable on Windows.
 The native server, projection probe and vision probe cross-build for ARM64.
-The lean baseline remains 527 inherited findings with zero new findings.
+That historical lean receipt recorded 527 inherited findings with zero new findings.

@@ -201,6 +201,10 @@ pub const Matrix = struct {
         } else try tensor.dense(stream, x, m.data.ptr, if (m.bias) |b| b.ptr else 0, y, rows, m.k, m.n, input, m.dtype, output, false, 0);
     }
 
+    pub fn prepareDense(m: *Matrix, ops: ?cuda.dsv4_native.Ops, stream: cuda.Stream) !void {
+        if (m.convert_bf16 and m.native_kind != null) try m.convertNative(ops orelse return error.MissingKernel, stream);
+    }
+
     fn convertNative(m: *Matrix, ops: cuda.dsv4_native.Ops, stream: cuda.Stream) !void {
         var converted = try Device.alloc(m.data.d, @as(usize, m.k) * m.n * 2);
         errdefer converted.free();

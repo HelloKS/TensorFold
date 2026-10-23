@@ -265,3 +265,285 @@ test "a draw refuses a row holding a NaN or an infinity, greedy or sampled; fini
         try std.testing.expectEqual(try lanes.sampling.choose(gpa, &values, &ids, position, hot), try l.draw(&kept, hot, position));
     }
 }
+
+test "chunked cluster prefill matches whole prefill and cancelled chunks release both ranks" {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const w = try toy.Weights.init(arena.allocator(), .{}, 29);
+    const c = try Cluster.init(gpa, &w, 2, .{});
+    defer c.deinit();
+    c.leader.prefill_rows = 2;
+    const b = c.leader.backend();
+    var first = try lanes.Stream.init(gpa, .{ .id = "chunked", .prompt = &p1, .max_new = 4, .drafts = false });
+    defer first.deinit(gpa);
+    var steps: usize = 1;
+    while (!try b.vtable.prefill_step.?(b.ptr, &first)) steps += 1;
+    try std.testing.expectEqual((p1.len + 1) / 2, steps);
+    const expected = try decode(&w, &p1, null, 1);
+    defer gpa.free(expected);
+    try std.testing.expectEqual(expected[0], try b.read(try b.first(&first, p1.len)));
+    b.release(&first);
+    var cut = try lanes.Stream.init(gpa, .{ .id = "cancelled", .prompt = &p1, .max_new = 4, .drafts = false });
+    defer cut.deinit(gpa);
+    try std.testing.expect(!try b.vtable.prefill_step.?(b.ptr, &cut));
+    b.release(&cut);
+    var next = try lanes.Stream.init(gpa, .{ .id = "next", .prompt = &p2, .max_new = 4, .drafts = false });
+    defer next.deinit(gpa);
+    try b.prefill(&next);
+    const fresh = try decode(&w, &p2, null, 1);
+    defer gpa.free(fresh);
+    try std.testing.expectEqual(fresh[0], try b.read(try b.first(&next, p2.len)));
+    b.release(&next);
+}
+
+// exchange.Mem rendezvouses every step, so these tests drive their own follower thread and their own Shard vtables.
+
+const Done = struct { ok: bool = false, err: ?anyerror = null };
+
+fn follow_to(alloc: std.mem.Allocator, x: exchange.Exchange, shard: backend.Shard, done: *Done) void {
+    backend.follow(alloc, x, shard) catch |e| {
+        done.err = e;
+        return;
+    };
+    done.ok = true;
+}
+
+/// A shard whose only working vtable is `command`: enough for tests that never send a round.
+const Sink = struct {
+    bytes: [32]u8 = undefined,
+    len: usize = 0,
+    fn command(ptr: *anyopaque, bytes: []const u8) anyerror!void {
+        const s: *Sink = @ptrCast(@alignCast(ptr));
+        if (bytes.len > s.bytes.len) return error.PayloadTooLong;
+        @memcpy(s.bytes[0..bytes.len], bytes);
+        s.len = bytes.len;
+    }
+};
+
+fn unreachable_round(_: *anyopaque, _: std.mem.Allocator, _: exchange.Exchange, _: []const round.Row, _: ?[]f32) anyerror!void {
+    return error.TestingRound;
+}
+fn nothing(_: *anyopaque, _: u32, _: u32) void {}
+fn nothing_slot(_: *anyopaque, _: u32) void {}
+fn one_vocab(_: *anyopaque) u32 {
+    return 1;
+}
+
+fn hooked(sink: *Sink) backend.Shard {
+    return .{ .ptr = sink, .vtable = &.{ .forward = unreachable_round, .keep = nothing, .release = nothing_slot, .vocab = one_vocab, .command = Sink.command } };
+}
+
+fn mute() backend.Shard {
+    return .{ .ptr = undefined, .vtable = &.{ .forward = unreachable_round, .keep = nothing, .release = nothing_slot, .vocab = one_vocab } };
+}
+
+/// A real peer rank whose release calls are recorded beside the cache they free.
+const Tracked = struct {
+    r: *toy.Rank,
+    releases: [16]u32 = undefined,
+    count: std.atomic.Value(u32) = .init(0),
+
+    fn shard(t: *Tracked) backend.Shard {
+        return .{ .ptr = t, .vtable = &.{ .forward = forward, .keep = keep, .release = release, .vocab = vocab } };
+    }
+
+    fn forward(ptr: *anyopaque, a: std.mem.Allocator, x: exchange.Exchange, rows: []const round.Row, logits: ?[]f32) anyerror!void {
+        const t: *Tracked = @ptrCast(@alignCast(ptr));
+        return t.r.forward(a, x, rows, logits);
+    }
+
+    fn keep(ptr: *anyopaque, slot: u32, len: u32) void {
+        const t: *Tracked = @ptrCast(@alignCast(ptr));
+        t.r.keep(slot, len);
+    }
+
+    fn release(ptr: *anyopaque, slot: u32) void {
+        const t: *Tracked = @ptrCast(@alignCast(ptr));
+        const i = t.count.load(.monotonic);
+        t.releases[i] = slot;
+        t.count.store(i + 1, .release);
+        t.r.release(slot);
+    }
+
+    fn vocab(ptr: *anyopaque) u32 {
+        const t: *Tracked = @ptrCast(@alignCast(ptr));
+        return t.r.w.dims.vocab;
+    }
+};
+
+/// A drafter that only works through the slot-aware hook and records the slot it was given.
+const SlotOracle = struct {
+    oracle: Oracle,
+    slots: std.atomic.Value(u32) = .init(std.math.maxInt(u32)),
+
+    fn drafter(o: *SlotOracle) backend.Drafter {
+        return .{ .ptr = o, .guess = wrongPath, .guess_slot = guess };
+    }
+
+    fn wrongPath(_: *anyopaque, _: []const u32, _: ?Sampling, _: u64, _: []u32) anyerror!void {
+        return error.PlainGuessPath;
+    }
+
+    fn guess(ptr: *anyopaque, slot: u32, history: []const u32, s: ?Sampling, position: u64, out: []u32) anyerror!void {
+        const o: *SlotOracle = @ptrCast(@alignCast(ptr));
+        o.slots.store(slot, .release);
+        return Oracle.guess(&o.oracle, history, s, position, out);
+    }
+};
+
+test "a family command reaches the shard hook on every rank" {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const mem = try exchange.Mem.init(a, 2);
+    defer mem.deinit();
+    var lead_sink: Sink = .{};
+    var peer_sink: Sink = .{};
+    var done: Done = .{};
+    const peer = try std.Thread.spawn(.{}, follow_to, .{ gpa, mem.endpoint(1), hooked(&peer_sink), &done });
+    var l: backend.Leader = .{ .gpa = a, .x = mem.endpoint(0), .shard = hooked(&lead_sink) };
+    defer l.deinit();
+    try l.command("snapshot");
+    try l.stop();
+    peer.join();
+    if (done.err) |e| return e;
+    try std.testing.expect(done.ok);
+    try std.testing.expectEqualStrings("snapshot", peer_sink.bytes[0..peer_sink.len]);
+    try std.testing.expectEqualStrings("snapshot", lead_sink.bytes[0..lead_sink.len]); // the leader runs its own half
+}
+
+test "a shard without a command hook refuses a family command on the leader and the follower" {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const mem = try exchange.Mem.init(a, 2);
+    defer mem.deinit();
+    var done: Done = .{};
+    const peer = try std.Thread.spawn(.{}, follow_to, .{ gpa, mem.endpoint(1), mute(), &done });
+    var l: backend.Leader = .{ .gpa = a, .x = mem.endpoint(0), .shard = mute() };
+    defer l.deinit();
+    // no stop() here: the follower leaves follow() on this command, and a stop broadcast would wait on it
+    try std.testing.expectError(error.UnsupportedCommand, l.command("nope"));
+    peer.join();
+    if (done.err) |e| {
+        try std.testing.expectEqual(error.UnsupportedCommand, e);
+        return;
+    }
+    return error.MissingUnsupportedCommand;
+}
+
+test "the slot-aware drafter hook is the one the leader calls, with the lane's slot" {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const w = try toy.Weights.init(arena.allocator(), .{}, 1);
+    var cfg = try config();
+    defer cfg.deinit(gpa);
+    const c = try Cluster.init(gpa, &w, 1, .{});
+    defer c.deinit();
+    var rec: SlotOracle = .{ .oracle = .{ .w = &w } };
+    c.leader.drafter = rec.drafter();
+    var clock: lanes.fake.FixedClock = .{};
+    var engine = lanes.Engine.init(gpa, &cfg, c.leader.backend(), clock.clock());
+    defer engine.deinit();
+    var one = try lanes.Stream.init(gpa, .{ .id = "slot1", .prompt = &p1, .max_new = 6, .drafts = true });
+    defer one.deinit(gpa);
+    try engine.addStream(&one);
+    while (engine.activeCount() > 0) try engine.step();
+    // the plain Drafter.guess above errors, so arriving here proves the leader routed to guess_slot
+    try std.testing.expectEqual(@as(u32, 0), rec.slots.load(.acquire));
+    const own = try decode(&w, &p1, null, one.emitted().len);
+    defer gpa.free(own);
+    try std.testing.expectEqualSlices(u32, own, one.emitted()); // and the drafts still commit the model's own decode
+    rec.slots.store(std.math.maxInt(u32), .monotonic);
+    var two = try lanes.Stream.init(gpa, .{ .id = "slot2", .prompt = &p2, .max_new = 6, .drafts = true });
+    defer two.deinit(gpa);
+    try engine.addStream(&two);
+    while (engine.activeCount() > 0) try engine.step();
+    try std.testing.expectEqual(@as(u32, 1), rec.slots.load(.acquire)); // the second lane got the second slot
+}
+
+test "a fresh leader restarts drawn handles after the last lane releases" {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const w = try toy.Weights.init(arena.allocator(), .{}, 29);
+    const c = try Cluster.init(gpa, &w, 1, .{});
+    defer c.deinit();
+    const b = c.leader.backend();
+    var one = try lanes.Stream.init(gpa, .{ .id = "first", .prompt = &p1, .max_new = 4, .drafts = false });
+    defer one.deinit(gpa);
+    try b.prefill(&one);
+    const h1 = try b.first(&one, p1.len);
+    try std.testing.expectEqual(@as(u64, 0), h1);
+    _ = try b.read(h1);
+    const h2 = try b.queue(&one, .{ .handle = h1 }, p1.len + 1);
+    _ = try b.read(h2); // the host contract: every handle is read while its lane is still in the rounds
+    b.release(&one); // the last lane: this ends the drawn generation (backend.zig's clearRetainingCapacity)
+    var two = try lanes.Stream.init(gpa, .{ .id = "second", .prompt = &p2, .max_new = 4, .drafts = false });
+    defer two.deinit(gpa);
+    try b.prefill(&two);
+    const h3 = try b.first(&two, p2.len);
+    try std.testing.expectEqual(@as(u64, 0), h3); // without the clear this handle would continue at 2
+    const expected = try decode(&w, &p2, null, 1);
+    defer gpa.free(expected);
+    try std.testing.expectEqual(expected[0], try b.read(h3));
+    // reading h1/h2 here is out of contract: their generation ended with the release above
+    b.release(&two);
+}
+
+test "prefilling a stream twice releases its first slot on every rank" {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const w = try toy.Weights.init(arena.allocator(), .{}, 43);
+    const mem = try exchange.Mem.init(a, 2);
+    defer mem.deinit();
+    const lead_rank = try a.create(toy.Rank);
+    lead_rank.* = try toy.Rank.init(a, &w, 0, 2);
+    defer lead_rank.deinit();
+    const peer_rank = try a.create(toy.Rank);
+    peer_rank.* = try toy.Rank.init(a, &w, 1, 2);
+    defer peer_rank.deinit();
+    var tracked: Tracked = .{ .r = peer_rank };
+    var done: Done = .{};
+    const peer = try std.Thread.spawn(.{}, follow_to, .{ gpa, mem.endpoint(1), tracked.shard(), &done });
+    var l: backend.Leader = .{ .gpa = a, .x = mem.endpoint(0), .shard = toy_cluster.shardOf(lead_rank) };
+    defer l.deinit();
+    const b = l.backend();
+    var s = try lanes.Stream.init(gpa, .{ .id = "twice", .prompt = &p1, .max_new = 4, .drafts = false });
+    defer s.deinit(gpa);
+    try b.prefill(&s); // opens slot 0 on both ranks; no release yet
+    try std.testing.expectEqual(@as(u32, 0), tracked.count.load(.acquire));
+    try b.prefill(&s); // re-prefill: release(slot 0) broadcast first, the recreated slot's round after it
+    // the peer joins a step only after applying the previous one, so the release is already recorded here
+    try std.testing.expectEqual(@as(u32, 1), tracked.count.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 0), tracked.releases[0]);
+    b.release(&s); // releases the recreated slot (slot 1)
+    try l.stop();
+    peer.join();
+    if (done.err) |e| return e;
+    try std.testing.expect(done.ok);
+    try std.testing.expectEqual(@as(u32, 2), tracked.count.load(.acquire));
+    try std.testing.expectEqual(@as(u32, 1), tracked.releases[1]);
+    // the hazard itself: the re-prefilled slot's caches were freed on the peer (and here), not leaked
+    try std.testing.expect(peer_rank.caches.get(0) == null);
+    try std.testing.expect(peer_rank.caches.get(1) == null);
+    try std.testing.expect(lead_rank.caches.get(0) == null);
+}
+
+test "a trailing byte corrupts an ordinary command; only extensions carry payloads" {
+    var arena: std.heap.ArenaAllocator = .init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const frames = [_]round.Command{
+        .{ .kind = .round, .number = 3, .rows = &.{.{ .slot = 0, .token = 1, .index = 0, .sample = true }} },
+        .{ .kind = .release, .releases = &.{4} },
+        .{ .kind = .stop },
+    };
+    for (frames) |f| {
+        const bytes = try round.encode(a, f);
+        const longer = try a.alloc(u8, bytes.len + 1);
+        @memcpy(longer[0..bytes.len], bytes);
+        longer[longer.len - 1] = 0;
+        try std.testing.expectError(error.Corrupt, round.decode(a, longer));
+    }
+}

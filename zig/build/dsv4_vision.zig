@@ -2,6 +2,18 @@
 const std = @import("std");
 
 pub fn tests(b: *std.Build, core: *std.Build.Module, cuda: *std.Build.Module, all: *std.Build.Step) void {
+    const state_probe = b.addExecutable(.{ .name = "tf-dsv4-state-host", .root_module = b.createModule(.{
+        .root_source_file = b.path("zig/src/families/dsv4_vision/state_main.zig"), .target = b.graph.host, .optimize = .safe, .link_libc = true,
+        .imports = &.{.{ .name = "core", .module = core }, .{ .name = "cuda", .module = cuda }} }) });
+    b.step("dsv4-state-host", "Build the model-free device rollback and snapshot regression").dependOn(&b.addInstallArtifact(state_probe, .{}).step);
+    const lanes = b.createModule(.{ .root_source_file = b.path("zig/src/core/lanes/lanes.zig"), .target = b.graph.host, .optimize = .debug, .link_libc = true });
+    const fabric = b.createModule(.{ .root_source_file = b.path("zig/src/fabric/fabric.zig"), .target = b.graph.host, .optimize = .debug, .link_libc = true });
+    const cluster_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/cluster/backend.zig"), .target = b.graph.host, .optimize = .debug, .link_libc = true, .imports = &.{ .{ .name = "lanes", .module = lanes }, .{ .name = "fabric", .module = fabric } } }) });
+    b.step("test-dsv4-cluster", "Cluster lane and chunk/cancellation contracts on fake ranks").dependOn(&b.addRunArtifact(cluster_tests).step);
+    all.dependOn(&b.addRunArtifact(cluster_tests).step);
+    const text_tests = b.addTest(.{ .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv4_vision/serve/template.zig"), .target = b.graph.host, .optimize = .debug, .link_libc = true }) });
+    text_tests.root_module.addImport("json", @import("server.zig").json(b, b.graph.host, .debug));
+    b.step("test-dsv4-text", "Official DeepSeek text and tool prompt parity").dependOn(&b.addRunArtifact(text_tests).step);
     const family = b.createModule(.{
         .root_source_file = b.path("zig/src/families/dsv4_vision/dsv4_vision.zig"),
         .target = b.graph.host,
@@ -45,7 +57,20 @@ pub fn tests(b: *std.Build, core: *std.Build.Module, cuda: *std.Build.Module, al
     b.step("dsv4-image", "Build the native image preprocessing oracle runner").dependOn(&install_image.step);
 }
 
-pub fn nativeTargets(b: *std.Build, target: std.Build.ResolvedTarget, core: *std.Build.Module, cuda: *std.Build.Module) void {
+pub fn nativeTargets(b: *std.Build, target: std.Build.ResolvedTarget, core: *std.Build.Module, cuda: *std.Build.Module, lanes: *std.Build.Module) void {
+    const optimize: std.builtin.OptimizeMode = .safe;
+    const cluster_backend = b.createModule(.{ .root_source_file = b.path("zig/src/cluster/backend.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{.{ .name = "lanes", .module = lanes }} });
+    if (target.result.os.tag == .linux) { // tf-dsv4-verify speaks over link.zig's POSIX sockets, like the follower
+        const verify = b.addExecutable(.{ .name = "tf-dsv4-verify", .root_module = b.createModule(.{
+            .root_source_file = b.path("zig/src/families/dsv4_vision/verify_main.zig"), .target = target, .optimize = optimize, .link_libc = true,
+            .imports = &.{ .{ .name = "core", .module = core }, .{ .name = "cuda", .module = cuda }, .{ .name = "lanes", .module = lanes }, .{ .name = "cluster_backend", .module = cluster_backend }, .{ .name = "json", .module = @import("server.zig").json(b, target, optimize) } } }) });
+        b.step("dsv4-verify", "Build real-checkpoint DSpark/cache/concurrency token-ID qualification").dependOn(&b.addInstallArtifact(verify, .{}).step);
+    }
+    if (target.result.os.tag == .linux) {
+        const worker = b.addExecutable(.{ .name = "tf-dsv4-worker", .root_module = b.createModule(.{ .root_source_file = b.path("zig/src/families/dsv4_vision/worker_main.zig"), .target = target, .optimize = optimize, .link_libc = true, .imports = &.{ .{ .name = "core", .module = core }, .{ .name = "cuda", .module = cuda }, .{ .name = "lanes", .module = lanes }, .{ .name = "cluster_backend", .module = cluster_backend }, .{ .name = "json", .module = @import("server.zig").json(b, target, optimize) } } }) });
+        b.step("dsv4-worker", "Build the DeepSeek V4 TP2 follower").dependOn(&b.addInstallArtifact(worker, .{}).step);
+    }
+
     const contracts = b.addTest(.{ .root_module = b.createModule(.{
         .root_source_file = b.path("zig/src/families/dsv4_vision/dsv4_vision.zig"),
         .target = target,

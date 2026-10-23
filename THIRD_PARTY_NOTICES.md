@@ -351,7 +351,7 @@ No external reference, captured cubin, model shard or CUDA compiler is bundled b
 The shared EXL3 resolver split and CUDA lane option forwarding retain work from PR #728 by @ajensenwaud,
 with the common EXL3 and DeepSeek contributor credits preserved.
 
-# DeepSeek-V4 Flash Vision development
+## DeepSeek-V4 Flash Vision development
 
 DeepSeek AI's `DeepSeek-V4-Flash-Vision-Exp` reference, revision
 `6821d6ad3681a4b137b066b76094fa82ebd0a380`, is MIT licensed. Its config,
@@ -384,3 +384,36 @@ native ViT operators preserve the BF16 boundaries from `inference/vision.py`.
 The development-only `vision_reference.py` verifies that reference file's SHA256
 before loading it with the locally installed PyTorch CPU runtime. PyTorch is a
 validation dependency, is not bundled, and is not used for native inference.
+
+The text TP2 path selectively adapts `dsv41/link.zig` and `dsv41/comm.zig`
+from Bertholomus AI's revision `dfc8fe50af303fcbdda0e839cae3a18eb53be2e1`
+into `zig/src/families/dsv4_vision/link.zig` and `comm.zig`, and uses the
+`dsv41/native.zig` lane/server adapter pattern in `native.zig`.
+Copyright 2026 BertholomusAI (Albert Lee), Apache-2.0. The TCP port adds bounded
+reads/writes; NCCL adds asynchronous error checks and abort. No Engram,
+V4.1 model constants, recorded kernels or Python inference runtime are copied.
+
+`text_forward.zig`, `text_state.zig`, `text_runtime.zig` and
+`zig/kernels/cuda/dsv4_text.cu` implement the pinned DeepSeek model's text
+attention, compressor, indexer, mHC and MoE semantics. `zig/src/server/dsv4_text.zig`
+and the literal strings in `dsv4_prompts/` adapt the official
+`encoding/encoding_dsv4.py` text/DSML/reasoning encoding under the retained
+DeepSeek MIT license. The golden fixture contains outputs from that encoder
+and records its source SHA256. No model weights are included.
+
+### DeepSeek Vision-Exp serving integration
+
+`zig/src/families/dsv4_vision/dspark.zig`, `vision_forward.zig` and
+`vision_serving.zig` implement the DSpark, image visibility and preprocessing
+semantics in DeepSeek AI's `inference/model.py`, `inference/image_processor.py`
+and `encoding/encoding_dsv4.py` at revision
+`6821d6ad3681a4b137b066b76094fa82ebd0a380` (MIT; license above).
+The native text encoder renders image parts as trusted placeholders and retains
+upstream request provenance for literal text. No Python inference code is deployed.
+
+`state_plan.zig`, `text_state.zig`, `distributed_state.zig`, `serving.zig` and
+`image_cache.zig` are this fork's implementations of transactional rollback,
+rank-local state images, the existing TensorFold prefix-cache interface and
+bounded aligner-output caching. They reuse upstream lane verification, sampling,
+HTTP image normalization and URL fetching; they include no new third-party
+implementation or runtime dependency. Existing Bertholomus TCP/NCCL notices apply.

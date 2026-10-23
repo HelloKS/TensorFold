@@ -206,7 +206,20 @@ pub fn expand(vision: ?api.Vision, fetch: ?Fetch, text: model_text.Text, cx: *Cx
         const before = out_ids.items.len;
         const after = close;
         close = null;
-        if (t == v.image_token and prepared[k].pieces.len > 0) {
+        if (t == v.image_token and v.position != null) {
+            const img = prepared[k];
+            if (img.pieces.len > 0) return cx.refuse("an image processor cannot give both placed pieces and positioned rows");
+            k += 1;
+            const words = v.position.?(v.ctx, cx.a, img.gh, img.gw, @intCast(out_ids.items.len)) catch |e| return refusal(cx, v, k - 1, e);
+            if (words.len == 0 or words.len > img.tokens) return cx.refuse("the image processor exceeded its positioned row budget");
+            try imgs.append(cx.a, .{ .pixels = img.pixels, .gh = img.gh, .gw = img.gw, .at = @intCast(out_ids.items.len), .tokens = @intCast(words.len), .hash = img.hash });
+            try out_ids.appendSlice(cx.a, words);
+            for (words, 0..) |_, j| try key.append(cx.a, image_key.row(img.hash, j));
+            if (words.len >= 2) {
+                key.items[key.items.len - words.len] = image_key.open(img.hash);
+                key.items[key.items.len - 1] = image_key.close(img.hash);
+            }
+        } else if (t == v.image_token and prepared[k].pieces.len > 0) {
             try image_pieces.place(cx.a, &out_ids, &key, &imgs, t, prepared[k]);
             k += 1;
         } else if (t == v.image_token) {
@@ -298,6 +311,27 @@ fn fakePrepare(ctx: *anyopaque, a: std.mem.Allocator, bytes: []const u8, max_tok
     return .{ .pixels = try a.alloc(f32, 0), .gh = 2, .gw = 2 * tokens, .tokens = tokens, .hash = bytes[3] };
 }
 
+test "a processor giving both placed pieces and positioned rows is refused" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cx: Cx = .{ .a = a };
+    var dummy: u8 = 0;
+    const Both = struct {
+        fn prepare(_: *anyopaque, alloc: std.mem.Allocator, bytes: []const u8, _: u32) anyerror!api.PreparedImage {
+            const pieces = try alloc.alloc(api.Piece, 1); // a crop, as Step-5's processor would give
+            pieces[0] = .{ .pixels = &.{}, .gh = 1, .gw = 1, .tokens = 3, .before = &.{}, .after = &.{} };
+            return .{ .pixels = &.{}, .gh = 2, .gw = 2, .tokens = 3, .hash = bytes[3], .pieces = pieces };
+        }
+        fn ids(_: *anyopaque, alloc: std.mem.Allocator, _: u32, _: u32, _: u32) ![]u32 {
+            return alloc.dupe(u32, &.{ 130001, 130000, 130004 });
+        }
+    };
+    const v: api.Vision = .{ .ctx = &dummy, .prepare = Both.prepare, .position = Both.ids, .image_token = 9, .image_tokens = 64, .max_images = 4 };
+    const msgs = (try json.parseText(a, "[{\"role\":\"user\",\"content\":[{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:,%FF%D8%FFabc\"}}]}]")).ok;
+    try std.testing.expectError(error.Refused, expand(v, null, MarkText.text(), &cx, msgs, &.{ 1, 9, 2 }, 0));
+}
+
 test "placeholders expand to each image's tokens, the history and cache key with them" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -325,6 +359,39 @@ test "placeholders expand to each image's tokens, the history and cache key with
     // a placeholder the images do not account for is refused
     try std.testing.expectError(error.Refused, expand(v, null, MarkText.text(), &cx, msgs, &[_]u32{ 9, 9, 9 }, 0));
     _ = messages_mod;
+}
+
+test "positioned image rows update usage, history, order and the complete image cache identity" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var cx: Cx = .{ .a = a };
+    var dummy: u8 = 0;
+    const Placed = struct {
+        fn ids(_: *anyopaque, alloc: std.mem.Allocator, _: u32, _: u32, at: u32) ![]u32 {
+            const out = try alloc.alloc(u32, 3 - at % 4 + 2);
+            @memset(out, 130001);
+            out[out.len - 2] = 130000;
+            out[out.len - 1] = 130004;
+            return out;
+        }
+    };
+    const v: api.Vision = .{ .ctx = &dummy, .prepare = fakePrepare, .position = Placed.ids, .image_token = 9, .image_tokens = 64, .max_images = 4 };
+    const text =
+        \\[{"role":"user","content":[{"type":"image_url","image_url":{"url":"data:,%FF%D8%FFabcde"}}]},
+        \\ {"role":"user","content":[{"type":"image_url","image_url":{"url":"data:,%FF%D8%FFfghij"}}]}]
+    ;
+    const msgs = (try json.parseText(a, text)).ok;
+    const x = (try expand(v, null, MarkText.text(), &cx, msgs, &.{1, 9, 2, 9, 3}, 3)).?;
+    try std.testing.expectEqual(@as(u32, 1), x.images[0].at);
+    try std.testing.expectEqual(@as(u32, 4), x.images[0].tokens);
+    try std.testing.expectEqual(@as(u32, 6), x.images[1].at);
+    try std.testing.expectEqual(@as(u32, 3), x.images[1].tokens);
+    try std.testing.expectEqual(@as(usize, 6), x.history_len);
+    try std.testing.expectEqual(@as(usize, 10), x.ids.len);
+    try std.testing.expectEqual(image_key.open('a'), x.cache_key[1]);
+    try std.testing.expectEqual(image_key.close('a'), x.cache_key[4]);
+    try std.testing.expectEqual(image_key.open('f'), x.cache_key[6]);
 }
 
 test "a wrapped image: the server writes the wrapper around each image's rows, in the history count too" {

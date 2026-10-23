@@ -1,8 +1,9 @@
 //! The lanes backend for a cluster: the leader plans each round and broadcasts it; every rank runs its shard of every row.
 const std = @import("std");
 const lanes = @import("lanes");
-const exchange = @import("exchange.zig");
-const round = @import("round.zig");
+pub const canon = @import("canon.zig");
+pub const exchange = @import("exchange.zig");
+pub const round = @import("round.zig");
 
 const be = lanes.backend;
 const Stream = lanes.Stream;
@@ -19,6 +20,7 @@ pub const Shard = struct {
         keep: *const fn (ptr: *anyopaque, slot: u32, len: u32) void,
         release: *const fn (ptr: *anyopaque, slot: u32) void,
         vocab: *const fn (ptr: *anyopaque) u32,
+        command: ?*const fn (*anyopaque, []const u8) anyerror!void = null,
     };
 };
 
@@ -26,6 +28,12 @@ pub const Shard = struct {
 pub const Drafter = struct {
     ptr: *anyopaque,
     guess: *const fn (ptr: *anyopaque, history: []const u32, sampling: ?lanes.Sampling, position: u64, out: []u32) anyerror!void,
+    guess_slot: ?*const fn (*anyopaque, u32, []const u32, ?lanes.Sampling, u64, []u32) anyerror!void = null,
+};
+pub const Prompt = struct {
+    ptr: *anyopaque,
+    begin: *const fn (*anyopaque, *Stream, u32) anyerror!u32,
+    end: ?*const fn (*anyopaque, *Stream, u32, u32) anyerror!u32 = null,
 };
 
 /// Apply every command the leader broadcasts until it says stop; any rank but 0 runs this.
@@ -42,6 +50,7 @@ pub fn follow(gpa: Allocator, x: exchange.Exchange, shard: Shard) !void {
             .round => try shard.vtable.forward(shard.ptr, a, x, cmd.rows, null),
             .release => {},
             .stop => return,
+            .extension => try (shard.vtable.command orelse return error.UnsupportedCommand)(shard.ptr, cmd.payload),
         }
     }
 }
@@ -73,6 +82,10 @@ pub const Leader = struct {
     next_slot: u32 = 0,
     rounds: u64 = 0,
     rows_run: u64 = 0,
+    prefill_rows: usize = 0,
+    prompt: ?Prompt = null,
+    pub fn slot(l: *Leader, s: *Stream) ?u32 { return if (l.lanes_by.get(s)) |ln| ln.slot else null; }
+    pub fn command(l: *Leader, bytes: []const u8) !void { try l.send(.{ .kind = .extension, .payload = bytes }, null); }
 
     pub fn deinit(l: *Leader) void {
         var it = l.lanes_by.valueIterator();
@@ -90,7 +103,7 @@ pub const Leader = struct {
     }
 
     pub fn backend(l: *Leader) be.Backend {
-        return .{ .ptr = l, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release } };
+        return .{ .ptr = l, .vtable = &.{ .prefill = prefill, .prefill_step = prefillStep, .reports_fill = true, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release } };
     }
 
     /// End every follower's loop.
@@ -122,6 +135,7 @@ pub const Leader = struct {
         _ = try exchange.broadcast(l.x, 0, bytes, views[0..l.x.size()]);
         apply(l.shard, cmd);
         if (cmd.kind == .round) try l.shard.vtable.forward(l.shard.ptr, a, l.x, cmd.rows, logits);
+        if (cmd.kind == .extension) try (l.shard.vtable.command orelse return error.UnsupportedCommand)(l.shard.ptr, cmd.payload);
     }
 
     fn self(ptr: *anyopaque) *Leader {
@@ -159,17 +173,40 @@ pub const Leader = struct {
     }
 
     fn prefill(ptr: *anyopaque, s: *Stream) anyerror!void {
+        release(ptr, s);
+        while (!try prefillStep(ptr, s)) {}
+    }
+
+    fn prefillStep(ptr: *anyopaque, s: *Stream) anyerror!bool {
         const l = self(ptr);
         const got = try l.lanes_by.getOrPut(l.gpa, s);
-        if (got.found_existing) l.freeLane(got.value_ptr);
-        got.value_ptr.* = .{ .slot = l.next_slot };
-        l.next_slot += 1;
+        if (!got.found_existing) {
+            got.value_ptr.* = .{ .slot = l.next_slot };
+            l.next_slot += 1;
+            if (l.prompt) |p| {
+                const cached = try p.begin(p.ptr, s, got.value_ptr.slot);
+                if (cached >= s.prompt().len and cached != 0) return error.SnapshotNotPrefix;
+                try got.value_ptr.history.appendSlice(l.gpa, s.prompt()[0..cached]);
+                s.cached = cached;
+            }
+        }
         const ln = got.value_ptr;
-        try ln.history.appendSlice(l.gpa, s.prompt());
-        const rows = try l.gpa.alloc(round.Row, s.prompt().len);
+        const start = ln.history.items.len;
+        if (start >= s.prompt().len) return true;
+        var end = @min(s.prompt().len, start + (if (l.prefill_rows == 0) s.prompt().len else l.prefill_rows));
+        for (s.reuse.marks) |mark| if (mark > start and mark < end) { end = mark; break; };
+        if (l.prompt) |p| if (p.end) |f| { end = try f(p.ptr, s, @intCast(start), @intCast(end)); };
+        const rows = try l.gpa.alloc(round.Row, end - start);
         defer l.gpa.free(rows);
-        for (rows, s.prompt(), 0..) |*r, t, i| r.* = .{ .slot = ln.slot, .token = t, .index = @intCast(i), .sample = i + 1 == rows.len };
+        for (rows, s.prompt()[start..end], start..) |*r, t, i| r.* = .{ .slot = ln.slot, .token = t, .index = @intCast(i), .sample = i + 1 == s.prompt().len };
+        l.gpa.free(ln.last);
+        ln.last = &.{};
         ln.last = try l.run(rows);
+        try ln.history.appendSlice(l.gpa, s.prompt()[start..end]);
+        s.fill_at.store(@intCast(end), .release);
+        if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(end)) != null)
+            if (s.reuse.hook) |hook| hook.at(hook.ptr, s, @intCast(end));
+        return end == s.prompt().len;
     }
 
     fn first(ptr: *anyopaque, s: *Stream, position: u64) anyerror!u64 {
@@ -256,7 +293,8 @@ pub const Leader = struct {
             try guess.append(l.gpa, if (r.first) |f| l.value(f) else r.follow[r.follow.len - 1]);
             try ln.held.resize(l.gpa, r.depth);
             const d = l.drafter orelse return error.NoDrafter;
-            try d.guess(d.ptr, guess.items, r.stream.sampling, r.position, ln.held.items);
+            if (d.guess_slot) |f| try f(d.ptr, ln.slot, guess.items, r.stream.sampling, r.position, ln.held.items)
+            else try d.guess(d.ptr, guess.items, r.stream.sampling, r.position, ln.held.items);
         }
     }
 
@@ -266,6 +304,7 @@ pub const Leader = struct {
         var ln = kv.value;
         _ = l.send(.{ .kind = .release, .releases = &.{ln.slot} }, null) catch {};
         l.freeLane(&ln);
+        if (l.lanes_by.count() == 0) l.drawn.clearRetainingCapacity();
     }
 };
 

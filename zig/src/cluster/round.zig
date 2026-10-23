@@ -12,7 +12,7 @@ pub const Row = struct {
 /// Trim slot `slot`'s caches to `len` tokens (the kept rows of its last window).
 pub const Keep = struct { slot: u32, len: u32 };
 
-pub const Kind = enum(u8) { round = 1, release = 2, stop = 3 };
+pub const Kind = enum(u8) { round = 1, release = 2, stop = 3, extension = 4 };
 
 pub const Command = struct {
     kind: Kind,
@@ -20,6 +20,7 @@ pub const Command = struct {
     keeps: []const Keep = &.{},
     releases: []const u32 = &.{},
     rows: []const Row = &.{},
+    payload: []const u8 = &.{},
 
     pub fn sampled(c: Command) usize {
         var n: usize = 0;
@@ -31,7 +32,8 @@ pub const Command = struct {
 pub const Error = error{ Short, Corrupt, OutOfMemory };
 
 pub fn encode(a: std.mem.Allocator, c: Command) Error![]u8 {
-    const n = 1 + 8 + 12 + c.keeps.len * 8 + c.releases.len * 4 + c.rows.len * 13;
+    if (c.kind != .extension and c.payload.len != 0) return error.Corrupt;
+    const n = 1 + 8 + 12 + c.keeps.len * 8 + c.releases.len * 4 + c.rows.len * 13 + c.payload.len;
     const out = try a.alloc(u8, n);
     out[0] = @backingInt(c.kind);
     std.mem.writeInt(u64, out[1..9], c.number, .little);
@@ -55,6 +57,7 @@ pub fn encode(a: std.mem.Allocator, c: Command) Error![]u8 {
         out[at + 12] = @intFromBool(r.sample);
         at += 13;
     }
+    @memcpy(out[at..], c.payload);
     return out;
 }
 
@@ -65,7 +68,8 @@ pub fn decode(a: std.mem.Allocator, b: []const u8) Error!Command {
     const nk = std.mem.readInt(u32, b[9..13], .little);
     const nr = std.mem.readInt(u32, b[13..17], .little);
     const nw = std.mem.readInt(u32, b[17..21], .little);
-    if (b.len != 21 + @as(usize, nk) * 8 + @as(usize, nr) * 4 + @as(usize, nw) * 13) return error.Corrupt;
+    const fixed = 21 + @as(usize, nk) * 8 + @as(usize, nr) * 4 + @as(usize, nw) * 13;
+    if (b.len < fixed or (c.kind != .extension and b.len != fixed)) return error.Corrupt;
     var at: usize = 21;
     const keeps = try a.alloc(Keep, nk);
     for (keeps) |*k| {
@@ -85,6 +89,7 @@ pub fn decode(a: std.mem.Allocator, b: []const u8) Error!Command {
     c.keeps = keeps;
     c.releases = releases;
     c.rows = rows;
+    c.payload = b[at..];
     return c;
 }
 
@@ -104,4 +109,16 @@ test "commands round-trip and refuse bad lengths" {
     var bad = try a.dupe(u8, b);
     bad[0] = 9;
     try std.testing.expectError(error.Corrupt, decode(a, bad));
+}
+
+test "family payloads use a distinct envelope without changing ordinary command bytes" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = try encode(a, .{ .kind = .extension, .payload = "snapshot", .keeps = &.{.{ .slot = 2, .len = 128 }} });
+    const decoded = try decode(a, bytes);
+    try std.testing.expectEqualStrings("snapshot", decoded.payload);
+    try std.testing.expectEqual(@as(u32, 128), decoded.keeps[0].len);
+    try std.testing.expectEqual(@as(usize, 21), (try encode(a, .{ .kind = .stop })).len);
+    try std.testing.expectError(error.Corrupt, encode(a, .{ .kind = .stop, .payload = "bad" }));
 }

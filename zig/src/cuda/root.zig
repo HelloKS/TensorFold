@@ -5,6 +5,7 @@ pub const dsv4_exl3 = @import("dsv4_exl3.zig");
 pub const dsv4_ops = @import("dsv4_ops.zig");
 pub const dsv4_vision = @import("dsv4_vision.zig");
 pub const dsv4_native = @import("dsv4_native.zig");
+pub const dsv4_text = @import("dsv4_text.zig");
 pub const dsv4_tensor = @import("dsv4_tensor.zig");
 pub const Driver = @import("driver.zig").Driver;
 pub const copy_source = @import("copy_source.zig");

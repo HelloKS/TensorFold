@@ -21,6 +21,8 @@ pub const Vision = struct {
     ctx: *anyopaque,
     /// The image's bytes (any format the platform decodes) at most ``max_tokens`` tokens; allocated in ``a``.
     prepare: *const fn (ctx: *anyopaque, a: Allocator, bytes: []const u8, max_tokens: u32) anyerror!PreparedImage,
+    /// Position-dependent row IDs, including the family's compression padding; null repeats `image_token`.
+    position: ?*const fn (*anyopaque, Allocator, u32, u32, u32) anyerror![]u32 = null,
     /// The token the chat template writes once per image, expanded to the image's tokens.
     image_token: u32,
     /// The tokens the template wraps an image in (the image token among them): text that spells one stays text.

@@ -64,7 +64,7 @@ test "request provenance: chat usage equals tokenize count and exact prompt ids 
         var fixture = try f.Fixture.init(a, index);
         defer fixture.deinit();
         var problem: []const u8 = "";
-        const hf = try HfText.load(a, std.testing.io, fixture.path, null, a, &problem);
+        const hf = try HfText.load(a, std.testing.io, fixture.path, null, null, a, &problem);
         defer hf.deinit();
         var script: Script = .{};
         const srv = try Server.init(a, std.testing.io, script.engine(), hf.text(), .{
@@ -126,7 +126,7 @@ test "request provenance: split spellings across image text parts stay ordinary"
     ;
     try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "chat_template.jinja", .data = source });
     var problem: []const u8 = "";
-    const hf = try HfText.load(a, std.testing.io, fixture.path, null, a, &problem);
+    const hf = try HfText.load(a, std.testing.io, fixture.path, null, null, a, &problem);
     defer hf.deinit();
     const image = hf.text().tokenId("<|image|>").?;
     const start = hf.text().tokenId("<|im_start|>").?;
@@ -158,7 +158,7 @@ test "request provenance: media prompt keeps authored image and video markers wh
     defer fixture.deinit();
     try fixture.tmp.dir.writeFile(std.testing.io, .{ .sub_path = "chat_template.jinja", .data = "<|image|><video>{{ messages[0]['content'] }}<|im_end|>" });
     var problem: []const u8 = "";
-    const hf = try HfText.load(a, std.testing.io, fixture.path, null, a, &problem);
+    const hf = try HfText.load(a, std.testing.io, fixture.path, null, null, a, &problem);
     defer hf.deinit();
     const image = hf.text().tokenId("<|image|>").?;
     const video = hf.text().tokenId("<|video|>").?;
