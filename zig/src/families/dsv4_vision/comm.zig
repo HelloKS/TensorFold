@@ -95,14 +95,12 @@ pub const Comm = struct {
         try c.g.lib.check(c.g.lib.api.ncclAllGather(send, recv, count, dtype, c.g.comm, stream.handle), "ncclAllGather");
     }
 
-    /// The named peer lines to rank 0: NCCL_COMM_ID's host at its port plus one answers fatal() in about a second.
+    /// The named peer lines to rank 0: the link's recorded host at its port plus one answers fatal() in about a second.
     fn startWatch(rank: u32, world: u32) void {
-        var buf: [32]u8 = undefined;
-        const ip = link_mod.bind_ip;
-        const id = std.fmt.bufPrint(&buf, "{d}.{d}.{d}.{d}:{d}", .{ ip[0], ip[1], ip[2], ip[3], link_mod.bind_port }) catch return;
-        buf[id.len] = 0;
-        const idz: [*:0]const u8 = buf[0..id.len :0];
-        if (env.setenv("NCCL_COMM_ID", idz, 1) != 0) return;
+        // NCCL_COMM_ID stays untouched: NCCL 2.32 would root its bootstrap on the very port the link already holds.
+        var buf: [64]u8 = undefined;
+        const name = tp_watch.nameAddress(&buf, link_mod.bind_ip, link_mod.bind_port) catch return;
+        tp_watch.setCommAddr(name) catch return; // copied into the watch module: the environment is not ours to write
         tp_watch.start(std.Options.debug_io, rank, world) catch {}; // best effort: a missing line never delays open
     }
 
@@ -197,10 +195,6 @@ pub const Comm = struct {
         c.drv = box; // the driver outlives the communicator, as the NCCL library does
         return box;
     }
-};
-
-const env = struct {
-    extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int; // as glm/cuda_native.zig names it
 };
 
 fn envOn(name: [*:0]const u8) bool {

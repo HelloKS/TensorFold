@@ -27,11 +27,31 @@ pub fn ended() void {
     ending.store(true, .release);
 }
 
-/// NCCL_COMM_ID's host (IPv4) at its port plus one.
+/// Named by the family before start(): rank 0's "ip:command-port", copied in; the lines bind port+1.
+var named: [64]u8 = undefined;
+var named_len: usize = 0;
+
+pub fn setCommAddr(name: []const u8) !void {
+    if (name.len == 0 or name.len > named.len) return error.NameTooLong;
+    @memcpy(named[0..name.len], name);
+    named_len = name.len;
+}
+
+pub fn clearCommAddr() void {
+    named_len = 0;
+}
+
+/// The address named for a rank 0 recorded at `ip`:`port`; the watch line lands at port+1.
+pub fn nameAddress(buf: []u8, ip: [4]u8, port: u16) ![]const u8 {
+    return std.fmt.bufPrint(buf, "{d}.{d}.{d}.{d}:{d}", .{ ip[0], ip[1], ip[2], ip[3], port });
+}
+
+/// The lines' target: the named host (IPv4) at its port plus one; the environment answers only when nothing was named.
 fn address() !posix.sockaddr.in {
-    const id = std.mem.span(platform.c.getenv("NCCL_COMM_ID") orelse return error.NoCommId);
+    const id = if (named_len > 0) named[0..named_len] else std.mem.span(platform.c.getenv("NCCL_COMM_ID") orelse return error.NoCommId);
     const colon = std.mem.lastIndexOfScalar(u8, id, ':') orelse return error.NoCommId;
     const port = (std.fmt.parseInt(u16, id[colon + 1 ..], 10) catch return error.NoCommId) +% 1;
+    if (named_len > 0 and port == 0) return error.PortWrap; // a named command port of 65535 has no plus-one to line to
     const ip = std.Io.net.IpAddress.parse(id[0..colon], port) catch return error.NoCommId;
     if (ip != .ip4) return error.NoCommId;
     return .{ .port = std.mem.nativeToBig(u16, port), .addr = std.mem.readInt(u32, &ip.ip4.bytes, .little) };
@@ -209,6 +229,33 @@ test "a record is 64 bytes, and a name past 56 bytes is cut" {
     const name: [70]u8 = @splat('x');
     @memcpy(r.text[0..@min(name.len, r.text.len)], name[0..@min(name.len, r.text.len)]);
     try std.testing.expectEqual(@as(usize, 56), std.mem.sliceTo(&r.text, 0).len);
+}
+
+test "a named address lines to its port plus one, never the command port, without the environment" {
+    const was = named_len;
+    defer named_len = was;
+    var buf: [64]u8 = undefined;
+    const name = try nameAddress(&buf, .{ 192, 168, 100, 10 }, 29621); // the first two-Spark run's link port
+    try std.testing.expectEqualStrings("192.168.100.10:29621", name);
+    try setCommAddr(name); // copied in: the caller's buffer may die on the next line
+    const a = try address();
+    try std.testing.expectEqual(@as(u16, 29622), std.mem.bigToNative(u16, a.port)); // NCCL's fault was binding the 29621 the link holds
+    var ip: [4]u8 = undefined;
+    std.mem.writeInt(u32, &ip, a.addr, .little);
+    try std.testing.expectEqualSlices(u8, &.{ 192, 168, 100, 10 }, &ip);
+    try setCommAddr("1.2.3.4:65535"); // a named port has no plus-one past the end of the range
+    try std.testing.expectError(error.PortWrap, address());
+}
+
+test "nothing is named and nothing is in the environment: no line is ever opened" {
+    const was = named_len;
+    defer named_len = was;
+    named_len = 0;
+    if (platform.c.getenv("NCCL_COMM_ID") != null) return error.SkipZigTest; // an operator's environment is not ours to rewrite
+    try std.testing.expectError(error.NoCommId, address());
+    try std.testing.expectError(error.NameTooLong, setCommAddr(""));
+    var long: [65]u8 = @splat('9');
+    try std.testing.expectError(error.NameTooLong, setCommAddr(&long));
 }
 
 const SleepTest = struct {

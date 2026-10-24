@@ -5,7 +5,7 @@
 const std = @import("std");
 const c = std.c;
 
-pub var bind_ip: [4]u8 = .{ 0, 0, 0, 0 }; // the address named at listen/connect: the rank plumbing derives NCCL_COMM_ID from it
+pub var bind_ip: [4]u8 = .{ 0, 0, 0, 0 }; // the address named at listen/connect: the watch line names itself from it
 pub var bind_port: u16 = 0;
 
 var pending: [512]u8 = undefined; // one link per rank process: a frame the vote rejected is parked here, whole
