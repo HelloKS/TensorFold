@@ -133,7 +133,7 @@ pub fn room(p: *anyopaque, local: u64) !u64 {
 pub fn plan(s: *State, o: anytype) !?kv.Layout {
     s.kv8 = if (@hasField(@TypeOf(o), "kv8")) o.kv8 else false;
     try agree(s, try @import("text_admission.zig").room(s.a, s.m.io, s.m.ctx)); // once per open, as the host's rankRoom did
-    s.layout = kv_pages.layout(s.m.c, s.kv8, s.m.context); // a kept state's slot is as large as this open's longest prompt
+    s.layout = kv_pages.layoutOf(s.m.c, o);
     return s.layout;
 }
 

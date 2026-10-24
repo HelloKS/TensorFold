@@ -236,7 +236,8 @@ pub const Sequence = struct {
         const journal = try a.alloc(?Snapshot, c.dspark_block_size + 1);
         @memset(journal, null);
         // A window's rows and an index's keys, back as BF16 for the sparse kernel: one buffer, every layer reuses it.
-        const staging = if (fp8) try D.alloc(d, (c.sliding_window + c.vision_max_n_token + c.index_topk) * c.head_dim * 2) else null;
+        errdefer a.free(journal);
+        const staging = if (fp8) try D.alloc(d, @import("sparse_rows.zig").capacity(c, context) * c.head_dim * 2) else null;
         errdefer if (staging) |*rows| rows.free();
         return .{ .a = a, .c = c, .layers = layers, .draft = draft, .taps = taps, .main = main, .journal = journal, .kv8 = fp8, .staging = staging };
     }

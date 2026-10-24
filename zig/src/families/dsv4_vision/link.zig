@@ -131,9 +131,10 @@ pub const Link = struct {
     fn takePending(l: Link, buf: []u8) ![]u8 {
         _ = l;
         if (buf.len < pending_len) return error.FrameTooLong;
-        @memcpy(buf[0..pending_len], pending[0..pending_len]);
+        const len = pending_len;
+        @memcpy(buf[0..len], pending[0..len]);
         pending_len = 0;
-        return buf[0..pending_len];
+        return buf[0..len];
     }
 
     /// One frame, waiting at most `ms` (only the TF_DSV4_P2P vote asks): null on timeout having consumed nothing.
@@ -193,4 +194,15 @@ pub fn parseIp(text: []const u8) ![4]u8 {
 test "addresses parse as four bytes" {
     try std.testing.expectEqual([4]u8{ 192, 0, 2, 7 }, try parseIp("192.0.2.7"));
     try std.testing.expectError(error.BadAddress, parseIp("192.0.2"));
+}
+
+test "a parked control frame retains its length and survives a short receive buffer" {
+    const link: Link = .{ .fd = undefined };
+    defer pending_len = 0;
+    link.unread("ready-v1");
+    var short: [4]u8 = undefined;
+    try std.testing.expectError(error.FrameTooLong, link.takePending(&short));
+    var out: [32]u8 = undefined;
+    try std.testing.expectEqualStrings("ready-v1", try link.takePending(&out));
+    try std.testing.expectEqual(@as(usize, 0), pending_len);
 }

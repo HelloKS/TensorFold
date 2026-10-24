@@ -53,5 +53,9 @@ test {
     _ = rowtab;
     _ = rounds;
     _ = @import("rounds_test.zig");
+    _ = @import("rounds_device_test.zig");
+    _ = @import("sparse_rows.zig");
+    _ = @import("link.zig");
+    _ = @import("window_cost.zig");
     _ = @import("rounds_ranks_test.zig");
 }

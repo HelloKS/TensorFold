@@ -119,7 +119,6 @@ fn better(_: void, a: Score, b: Score) bool {
 }
 pub fn attention(m: anytype, p: []const u8, l: *st.Layer, seq: *st.Sequence, pos: u32, ratio: usize, visible: ?@import("image_layout.zig").Span) !void {
     var b: [160]u8 = undefined;
-    const heads = m.c.num_attention_heads / 2;
     const dim = m.c.head_dim;
     try query(m, p, pos, ratio > 0);
     try keyValue(m, p, pos, ratio > 0);
@@ -169,13 +168,8 @@ pub fn attention(m: anytype, p: []const u8, l: *st.Layer, seq: *st.Sequence, pos
     };
     try m.sync();
     try m.r.buf(.selected).upload(0, std.mem.sliceAsBytes(indices[0..selected]));
-    var full = l.kv.ptr;
-    if (m.kv8) { // the sparse kernel reads BF16: the selected rows come back through their scales, into the sequence's one staging buffer
-        const rows = seq.staging orelse return error.MissingStaging;
-        try m.r.text.call("gather8", m.stream, @intCast(selected), 256, .{ l.kv.ptr, m.r.p(.selected), rows.ptr, @as(u32, @intCast(selected)), @as(u32, @intCast(dim)), @as(u32, @intCast(rowBytes(m, dim))) });
-        full = rows.ptr;
-    }
-    try m.r.operators.model.sparse(m.stream, m.r.p(.q), full, m.r.p(.selected), try m.w.ptr(try key(&b, "{s}.attn.attn_sink", .{p})), m.r.p(.attn), .{ .rows = 1, .heads = @intCast(heads), .selected = @intCast(selected), .dim = @intCast(dim) });
+    try @import("sparse_rows.zig").run(m, seq.staging, l.kv.ptr,
+        try m.w.ptr(try key(&b, "{s}.attn.attn_sink", .{p})), selected);
     try outputProjection(m, p, pos, ratio > 0);
 
 }

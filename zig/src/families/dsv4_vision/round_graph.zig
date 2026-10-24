@@ -403,8 +403,8 @@ pub const Graphs = struct {
     agreement: ?graphs.Agreement = null,
     cache: graphs.Cache,
 
-    pub fn init(gpa: std.mem.Allocator, s: graphs.Settings, capture: Pieces, collective: ?Collective, agree: ?gc.Agree) Graphs {
-        var g: Graphs = .{
+    pub fn init(g: *Graphs, gpa: std.mem.Allocator, s: graphs.Settings, capture: Pieces, collective: ?Collective, agree: ?gc.Agree) void {
+        g.* = .{
             .gpa = gpa,
             .settings = s,
             .rows_max = s.rows_max,
@@ -417,7 +417,6 @@ pub const Graphs = struct {
         g.cache.meter = graphs.meter;
         g.cache.name = "decode rounds";
         graphs.rule = s.room;
-        return g;
     }
 
     /// null: the round stays the caller's to run; else the cache ran it, and the outcome says who advances.
@@ -450,4 +449,11 @@ pub const Graphs = struct {
 /// The addresses a graphed round bakes in (staged statics, the row table, the gathered exchange): any change drops all.
 pub fn fingerprint(words: []const u64) u64 {
     return gc.fingerprintOf(words);
+}
+
+test "the production graph cache retains its owning engine address" {
+    var g: Graphs = undefined;
+    g.init(std.testing.allocator, .{ .on = true }, undefined, null, null);
+    defer g.deinit();
+    try std.testing.expectEqual(@intFromPtr(&g.engine), @intFromPtr(g.cache.engine.ctx));
 }

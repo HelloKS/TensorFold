@@ -58,6 +58,7 @@ pub fn plan(m: anytype, rows: anytype, cap: u32) Plan {
     for (segs, 0..) |s, i| {
         p.segs[i] = s;
         p.n_segs += 1;
+        if (s.rows != 1) p.graphable = false;
     }
     p.last_pos = rowtab.lastPos(segs);
     return p;
@@ -203,7 +204,7 @@ pub const Device = struct {
     pub fn stage(m: anytype, p: *const Plan) !void {
         const rb = m.rb.?;
         const cap = rb.rows_max;
-        _ = try rowtab.plan(p.rows[0..p.n], p.R, cap, rb.host[0..rowtab.ncol * cap], rb.host[rowtab.sampledOffset(cap) ..]);
+        _ = try rowtab.plan(p.rows[0..p.n], p.R, cap, rb.host[0..rowtab.ncol * cap], rb.host[rowtab.ncol * cap ..]);
         try rb.table.upload(0, std.mem.sliceAsBytes(rb.host[0 .. rowtab.ncol * cap + p.n_sampled]));
         try rb.ops.call("ids", m.stream, (p.R + 127) / 128, 128, .{ rb.table.ptr, rb.ids.ptr, p.R });
     }
@@ -214,7 +215,7 @@ pub const Device = struct {
         _ = p;
         const rb = m.rb.?;
         const vb = rb.vh * 4;
-        try m.r.buf(.logits).copyFrom(i * vb, m.r.p(.logits), vb, m.stream.handle);
+        try rb.exch.copyFrom(i * vb, m.r.p(.logits), vb, m.stream.handle);
     }
     pub fn round(m: anytype, p: *const Plan, logits: ?[]f32) !void {
         const rb = m.rb.?;

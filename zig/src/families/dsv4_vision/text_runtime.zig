@@ -2,7 +2,7 @@
 const std = @import("std");
 const cuda = @import("cuda");
 const gpu = @import("gpu_weights.zig");
-pub const B = enum { h, residual, x, norm, qr, q, kv, attn, grouped, out, gate, up, act, expert, accum, mixes, pre, post, comb, logits, ixq, ixw, score, selected, picks, routeweights, ids, gather, tmp };
+pub const B = enum { h, residual, x, norm, qr, q, kv, attn, grouped, out, gate, up, act, expert, accum, mixes, pre, post, comb, logits, ixq, ixw, score, selected, linear, picks, routeweights, ids, gather, tmp };
 pub const Runtime = struct {
     operators: @import("vision_graph.zig").Runtime,
     text: cuda.dsv4_text.Ops,
@@ -17,10 +17,14 @@ pub const Runtime = struct {
         r.scratch = .{};
         var n: usize = 0;
         errdefer for (r.buffers[0..n]) |*v| v.free();
-        for (&r.buffers) |*v| {
-            v.* = try cuda.DeviceBuffer.alloc(d, 1 << 20);
+        for (&r.buffers, 0..) |*v, i| {
+            const bytes: usize = if (i == @intFromEnum(B.linear)) @import("sparse_rows.zig").max_selected * 4 else 1 << 20;
+            v.* = try cuda.DeviceBuffer.alloc(d, bytes);
             n += 1;
         }
+        var linear: [@import("sparse_rows.zig").max_selected]i32 = undefined;
+        for (&linear, 0..) |*index, i| index.* = @intCast(i);
+        try r.buf(.linear).upload(0, std.mem.asBytes(&linear));
         return r;
     }
     pub fn free(r: *Runtime) void {
@@ -51,10 +55,16 @@ pub fn frequencies(c: @import("config.zig").Config, compressed: bool) [32]f32 {
     }
     return out;
 }
-pub fn fingerprint(a: std.mem.Allocator, io: std.Io, dir: ?[]const u8, storage: @import("storage.zig").Storage, batched: bool, rows_cap: u32, kv8: bool, wc: bool) ![32]u8 {
+pub const Modes = struct {
+    dspark: bool = false,
+    graph: @import("graphs.zig").Settings = .{},
+    p2p: bool = false,
+    roce: bool = false,
+};
+pub fn fingerprint(a: std.mem.Allocator, io: std.Io, dir: ?[]const u8, storage: @import("storage.zig").Storage, batched: bool, rows_cap: u32, kv8: bool, wc: bool, modes: Modes) ![32]u8 {
     var sha = std.crypto.hash.sha2.Sha256.init(.{});
-    sha.update("dsv4-multimodal-dspark-tp2/v2");
-    inline for (.{ "text_forward.zig", "text_runtime.zig", "text_weights.zig", "text_state.zig", "text_model.zig", "text_identity.zig", "comm.zig", "link.zig", "state_plan.zig", "control.zig", "distributed_state.zig", "dspark.zig", "vision_forward.zig", "vision_serving.zig", "serving.zig", "native.zig", "text_admission.zig", "vision_graph.zig", "media.zig", "image_layout.zig", "picture.zig", "rgb.zig", "png.zig", "jpeg.zig", "weights.zig", "parallel.zig", "config.zig", "storage.zig", "image_cache.zig", "rowtab.zig", "rounds.zig", "graphs.zig", "round_graph.zig", "kv_pages.zig", "window_cost.zig" }) |file| {
+    sha.update("dsv4-multimodal-dspark-tp2/v3");
+    inline for (.{ "text_forward.zig", "text_runtime.zig", "text_weights.zig", "text_state.zig", "text_model.zig", "text_identity.zig", "comm.zig", "link.zig", "state_plan.zig", "control.zig", "distributed_state.zig", "dspark.zig", "vision_forward.zig", "vision_serving.zig", "serving.zig", "native.zig", "text_admission.zig", "vision_graph.zig", "media.zig", "image_layout.zig", "picture.zig", "rgb.zig", "png.zig", "jpeg.zig", "weights.zig", "parallel.zig", "config.zig", "storage.zig", "image_cache.zig", "rowtab.zig", "rounds.zig", "graphs.zig", "round_graph.zig", "kv_pages.zig", "window_cost.zig", "sparse_rows.zig" }) |file| {
         const source = @embedFile(file);
         for (source, 0..) |byte, i| {
             if (byte == '\r' and i + 1 < source.len and source[i + 1] == '\n') continue;
@@ -79,6 +89,16 @@ pub fn fingerprint(a: std.mem.Allocator, io: std.Io, dir: ?[]const u8, storage: 
     std.mem.writeInt(u32, gate[8..12], @as(u32, @intFromBool(kv8)), .little); // an fp8 rank and a bf16 rank must never form a pair
     std.mem.writeInt(u32, gate[12..16], @as(u32, @intFromBool(wc)), .little); // measuring ranks mirror passes; a measuring and a silent rank would desync
     sha.update(&gate);
+    sha.update(&.{ @intFromBool(modes.dspark), @intFromBool(modes.graph.on), @intFromBool(modes.p2p), @intFromBool(modes.roce) });
+    if (modes.graph.on) {
+        sha.update(&.{@intFromBool(modes.graph.floor_hold)});
+        var shape: [20]u8 = undefined;
+        std.mem.writeInt(u32, shape[0..4], modes.graph.max, .little);
+        std.mem.writeInt(u32, shape[4..8], modes.graph.bucket, .little);
+        std.mem.writeInt(u32, shape[8..12], modes.graph.rows_max, .little);
+        std.mem.writeInt(u64, shape[12..20], @bitCast(modes.graph.grow), .little);
+        sha.update(&shape);
+    }
     if (batched) {
         if (dir) |path| {
             const file = try std.fs.path.join(a, &.{ path, "dsv4_batch.fatbin" });
@@ -96,13 +116,27 @@ test "the execution identity covers the cache's row width, so an fp8 rank and a 
     defer arena.deinit();
     const a = arena.allocator();
     const storage: @import("storage.zig").Storage = .native_fp4_fp8;
-    const wide = try fingerprint(a, std.testing.io, null, storage, false, 0, true, false);
-    const plain = try fingerprint(a, std.testing.io, null, storage, false, 0, false, false);
+    const wide = try fingerprint(a, std.testing.io, null, storage, false, 0, true, false, .{});
+    const plain = try fingerprint(a, std.testing.io, null, storage, false, 0, false, false, .{});
     try std.testing.expect(!std.mem.eql(u8, &wide, &plain)); // identity.validate answers RankIdentityMismatch for a pair that differs only here
-    const again = try fingerprint(a, std.testing.io, null, storage, false, 0, true, false);
+    const again = try fingerprint(a, std.testing.io, null, storage, false, 0, true, false, .{});
     try std.testing.expectEqualSlices(u8, &wide, &again); // the same gates hash the same: the refusal is the flag, never the digest drifting
-    const measured = try fingerprint(a, std.testing.io, null, storage, false, 0, true, true);
+    const measured = try fingerprint(a, std.testing.io, null, storage, false, 0, true, true, .{});
     try std.testing.expect(!std.mem.eql(u8, &wide, &measured)); // a measuring rank and a silent rank must never form a pair either
+}
+
+test "ranks refuse different startup passes, graph collectives and transport negotiation modes" {
+    const a = std.testing.allocator;
+    const plain = try fingerprint(a, std.testing.io, null, .native_fp4_fp8, true, 24, false, true, .{});
+    for ([_]Modes{ .{ .dspark = true }, .{ .graph = .{ .on = true } }, .{ .p2p = true }, .{ .roce = true } }) |mode| {
+        const other = try fingerprint(a, std.testing.io, null, .native_fp4_fp8, true, 24, false, true, mode);
+        try std.testing.expect(!std.mem.eql(u8, &plain, &other));
+    }
+    const graph = try fingerprint(a, std.testing.io, null, .native_fp4_fp8, true, 24, false, true, .{ .graph = .{ .on = true } });
+    const capped = try fingerprint(a, std.testing.io, null, .native_fp4_fp8, true, 24, false, true, .{ .graph = .{ .on = true, .rows_max = 2 } });
+    try std.testing.expect(!std.mem.eql(u8, &graph, &capped));
+    const held = try fingerprint(a, std.testing.io, null, .native_fp4_fp8, true, 24, false, true, .{ .graph = .{ .on = true, .floor_hold = true } });
+    try std.testing.expect(!std.mem.eql(u8, &graph, &held));
 }
 
 test "plain and compressed YaRN frequencies match the pinned official float32 reference" {

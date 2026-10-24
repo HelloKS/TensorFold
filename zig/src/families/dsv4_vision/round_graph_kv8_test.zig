@@ -13,7 +13,7 @@ const ring_bytes: usize = 4096;
 
 /// The kv8 fingerprint folded the production way: the real text_runtime.fingerprint through the shared digestWord.
 fn folded(kv8: bool) ![32]u8 {
-    return runtime.fingerprint(testing.allocator, std.testing.io, null, .native_fp4_fp8, false, 0, kv8, false);
+    return runtime.fingerprint(testing.allocator, std.testing.io, null, .native_fp4_fp8, false, 0, kv8, false, .{});
 }
 
 /// A fabricated device buffer: the graphWords walk only ever reads ptr, so a real struct needs no driver.

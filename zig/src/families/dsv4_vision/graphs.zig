@@ -146,6 +146,7 @@ pub fn meter() ?f64 {
 
 /// MemAvailable in GiB (null where /proc/meminfo cannot be read, as on this Windows host).
 pub fn memAvailableGiB() ?f64 {
+    if (@import("builtin").os.tag != .linux) return null;
     var buf: [4096]u8 = undefined;
     const fd = std.c.open("/proc/meminfo", .{ .ACCMODE = .RDONLY });
     if (fd < 0) return null;

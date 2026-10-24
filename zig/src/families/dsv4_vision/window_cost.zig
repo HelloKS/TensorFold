@@ -38,6 +38,7 @@ pub fn measure(m: anytype, t: *Table, widths: u32) !void {
     for (1..widths + 1) |w| {
         const width: u32 = @intCast(w);
         const slot: u32 = 64 + width;
+        defer m.releaseRows(slot);
         for (0..w) |i| rows[i] = .{ .slot = slot, .token = 0, .index = @intCast(i), .sample = i + 1 == w };
         const span = rows[0..w];
         var pass: usize = 0;
@@ -52,8 +53,23 @@ pub fn measure(m: anytype, t: *Table, widths: u32) !void {
                 try t.set(width, ms);
             }
         }
-        m.releaseRows(slot);
     }
+}
+
+test "a failed timing pass returns its scratch sequence to the serving pool" {
+    const Failing = struct {
+        held: bool = false,
+        pub fn now(_: *@This()) u64 { return 1; }
+        pub fn timeRows(m: *@This(), _: []const cluster.round.Row) !void {
+            m.held = true;
+            return error.ForwardFailed;
+        }
+        pub fn releaseRows(m: *@This(), _: u32) void { m.held = false; }
+    };
+    var m: Failing = .{};
+    var table: Table = .{};
+    try std.testing.expectError(error.ForwardFailed, measure(&m, &table, 6));
+    try std.testing.expect(!m.held);
 }
 
 const testing = std.testing;

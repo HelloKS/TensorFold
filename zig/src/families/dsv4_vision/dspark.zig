@@ -82,14 +82,7 @@ pub fn propose(m: anytype, seq: *st.Sequence, token: u32, out: []u32) !void {
             try fw.hc(m, p, "attn");
             try m.r.buf(.q).copyFrom(0, queries.ptr + i * qbytes, qbytes, m.stream.handle);
             const sink = try m.w.ptr(try fw.key(&b, "{s}.attn.attn_sink", .{p}));
-            var read = layer.kv.ptr;
-            if (m.kv8) { // the draft reads its window and block rows back as BF16, the same staging the target's sparse uses
-                const rows = seq.staging orelse return error.MissingStaging;
-                try m.r.text.call("gather8", m.stream, @intCast(past + size), 256, .{ layer.kv.ptr, m.r.p(.selected), rows.ptr, @as(u32, @intCast(past + size)), @as(u32, @intCast(m.c.head_dim)), @as(u32, @intCast(fw.rowBytes(m, m.c.head_dim))) });
-                read = rows.ptr;
-            }
-            try m.r.operators.model.sparse(m.stream, m.r.p(.q), read, m.r.p(.selected), sink, m.r.p(.attn),
-                .{ .rows = 1, .heads = @intCast(m.c.num_attention_heads / 2), .selected = @intCast(past + size), .dim = @intCast(m.c.head_dim) });
+            try @import("sparse_rows.zig").run(m, seq.staging, layer.kv.ptr, sink, past + size);
             try fw.outputProjection(m, p, seq.len + @as(u32, @intCast(i)), false);
             try fw.post(m);
             try fw.hc(m, p, "ffn");

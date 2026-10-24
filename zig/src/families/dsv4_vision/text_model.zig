@@ -63,7 +63,12 @@ pub const Model = struct {
         const rows_cap = try rd.capFromEnv(native.env("TF_DSV4_ROWS_CAP"));
         const dspark = std.mem.eql(u8, native.env("TF_DSV4_DSPARK") orelse "0", "1");
         const wc_on = std.mem.eql(u8, native.env("TF_DSV4_WC") orelse "1", "1");
-        const execution = try runtime.fingerprint(a, io, kernels, c.storage, batched, rows_cap, kv8, wc_on);
+        const gs: graphs.Settings = if (batched) try graphs.Settings.fromEnv() else .{};
+        const execution = try runtime.fingerprint(a, io, kernels, c.storage, batched, rows_cap, kv8, wc_on, .{
+            .dspark = dspark, .graph = gs,
+            .p2p = std.mem.eql(u8, native.env("TF_DSV4_P2P") orelse "0", "1"),
+            .roce = std.mem.eql(u8, native.env("TF_DSV4_ROCE") orelse "0", "1"),
+        });
         const hello = try identity.encode(local.identity, execution, @intCast(context), rank);
         var peer: [72]u8 = undefined;
         if (rank == 0) {
@@ -114,7 +119,6 @@ pub const Model = struct {
         if (!std.mem.eql(u8, &done, "ready-v1")) return error.RankNotReady;
         m.* = .{ .a = a, .io = io, .d = ctx.d, .c = c, .rank = rank, .context = context, .stream = s, .r = r, .w = w, .link = link, .comm = comm, .freq = freq, .idle = idle, .identity = @import("cache_key.zig").namespace(c.storage, local.identity, execution), .rb = rb, .ctx = ctx, .kv8 = kv8, .dspark = dspark };
         if (rb != null) {
-            const gs = try graphs.Settings.fromEnv(); // bad knobs fail the open, never a silent half-graphed rank
             if (gs.on) {
                 m.gr = try a.create(rg.Graphs);
                 errdefer {
@@ -122,7 +126,7 @@ pub const Model = struct {
                     a.destroy(m.gr.?);
                     m.gr = null;
                 }
-                m.gr.?.* = rg.Graphs.init(a, gs, rg.CudaPieces.pieces(), rg.nccl(&m.comm), null);
+                m.gr.?.init(a, gs, rg.CudaPieces.pieces(), rg.nccl(&m.comm), null);
                 m.gr.?.agreement = try graphs.Agreement.init(ctx.d, &m.comm, m.stream);
                 m.gr.?.cache.agree = m.gr.?.agreement.?.agree();
             }

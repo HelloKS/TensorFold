@@ -143,11 +143,25 @@ test "plan: ordinary decode rounds are graphable, dspark rounds and serial fallb
     var arena: std.heap.ArenaAllocator = .init(testing.allocator);
     defer arena.deinit();
     var plain: Fake = .{ .a = arena.allocator() };
-    const rows = verifyRows();
+    const rows = [_]Row{
+        .{ .slot = 0, .token = 1, .index = 10, .sample = true },
+        .{ .slot = 1, .token = 2, .index = 20, .sample = true },
+    };
     try testing.expect(rounds.plan(&plain, &rows, rowtab.cap_max).graphable);
     var spec: Fake = .{ .a = arena.allocator(), .dspark = true };
     try testing.expect(!rounds.plan(&spec, &rows, rowtab.cap_max).graphable);
     try testing.expect(!rounds.plan(&plain, &.{.{ .slot = 0, .token = 1, .index = 0, .sample = true }}, 24).graphable);
+}
+
+test "multirow prefill stays eager because graph replay advances each sequence only after the round" {
+    var m: Fake = .{ .a = testing.allocator };
+    const rows = [_]Row{
+        .{ .slot = 0, .token = 1, .index = 10, .sample = false },
+        .{ .slot = 0, .token = 2, .index = 11, .sample = false },
+    };
+    const p = rounds.plan(&m, &rows, rowtab.cap_max);
+    try testing.expectEqual(rounds.Fallback.none, p.fallback);
+    try testing.expect(!p.graphable);
 }
 
 test "rowProgram: steps replay rows [from, to) through the rowBody, clamped to the plan" {
