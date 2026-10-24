@@ -31,6 +31,15 @@ the tokenizer files. The reader checks hashes and shapes; the writer splits
 original packed payload/scales losslessly. It does not requantize weights.
 Regenerate a cache when the inspector reports an incompatible cache ABI.
 
+`TF_DSV4_SKIP_PAYLOAD_HASH=1` skips the full rank-file SHA256 scan at startup.
+Set it on each node whose cache you trust; unset it or set `0` for full checking
+(the default). A warning records the skip. File size, manifest identity, config,
+cache ABI and tensor layout checks still run, but same-size payload corruption
+is no longer detected. This option does not skip source hashing during cache
+preparation. Rebuild both binaries and the inspector after upgrading; adding
+this option changes the source-based cache ABI, so prepare a new cache in an
+empty directory with the rebuilt inspector before using it.
+
 ## Serve
 
 On both nodes, replace the reserved address with the head's fabric address:

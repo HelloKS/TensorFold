@@ -44,7 +44,9 @@ pub const Cache = struct {
         const rank_path = try std.fs.path.join(a, &.{ dir, name });
         const expected = try digest(try field(entry, "sha256"));
         const expected_bytes = try integer(try field(entry, "bytes"));
-        if (!std.mem.eql(u8, &try fileDigest(io, rank_path, expected_bytes), &expected)) return error.CacheDigestMismatch;
+        const skip = skipPayloadHash(if (std.c.getenv("TF_DSV4_SKIP_PAYLOAD_HASH")) |v| std.mem.span(v) else null);
+        if (skip) std.log.warn("rank {d}: payload SHA256 skipped; cache corruption is unchecked", .{rank});
+        try verifyPayload(io, rank_path, expected_bytes, expected, skip);
         var tensors: catalog.Catalog = .{};
         try tensors.addFile(a, io, rank_path);
         var local: std.ArrayList(weights.Spec) = .empty;
@@ -83,11 +85,16 @@ fn digest(value: std.json.Value) ![32]u8 {
     return out;
 }
 
-fn fileDigest(io: std.Io, path: []const u8, expected_bytes: u64) ![32]u8 {
+fn skipPayloadHash(value: ?[]const u8) bool {
+    return std.mem.eql(u8, value orelse "0", "1");
+}
+
+fn verifyPayload(io: std.Io, path: []const u8, expected_bytes: u64, expected: [32]u8, skip: bool) !void {
     var file = try std.Io.Dir.cwd().openFile(io, path, .{});
     defer file.close(io);
     const len = try file.length(io);
     if (len != expected_bytes) return error.CacheSizeMismatch;
+    if (skip) return;
     var hash: Sha = .init(.{});
     var buffer: [64 * 1024]u8 = undefined;
     var at: u64 = 0;
@@ -97,7 +104,26 @@ fn fileDigest(io: std.Io, path: []const u8, expected_bytes: u64) ![32]u8 {
         hash.update(buffer[0..n]);
         at += n;
     }
-    return hash.finalResult();
+    if (!std.mem.eql(u8, &hash.finalResult(), &expected)) return error.CacheDigestMismatch;
+}
+
+test "payload hashing defaults on and skipping still rejects a truncated cache" {
+    const t = std.testing;
+    for ([_]?[]const u8{ null, "", "0", "true", "01" }) |value| try t.expect(!skipPayloadHash(value));
+    try t.expect(skipPayloadHash("1"));
+    var temp = t.tmpDir(.{});
+    defer temp.cleanup();
+    try temp.dir.writeFile(t.io, .{ .sub_path = "rank.safetensors", .data = "original" });
+    var buf: [256]u8 = undefined;
+    const path = try std.fmt.bufPrint(&buf, ".zig-cache/tmp/{s}/rank.safetensors", .{temp.sub_path});
+    var expected: [32]u8 = undefined;
+    Sha.hash("original", &expected, .{});
+    try verifyPayload(t.io, path, 8, expected, false);
+    try temp.dir.writeFile(t.io, .{ .sub_path = "rank.safetensors", .data = "modified" });
+    try t.expectError(error.CacheDigestMismatch, verifyPayload(t.io, path, 8, expected, false));
+    try verifyPayload(t.io, path, 8, expected, true);
+    try t.expectError(error.CacheSizeMismatch, verifyPayload(t.io, path, 9, expected, true));
+    try t.expectError(error.CacheSizeMismatch, verifyPayload(t.io, path, 7, expected, false));
 }
 
 test "cache digests and manifests reject malformed identities" {
