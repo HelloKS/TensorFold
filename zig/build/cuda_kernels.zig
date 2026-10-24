@@ -21,6 +21,7 @@ pub const kernels = [_]Kernel{
     .{ .name = "dsv4_vision", .flags = glue },
     .{ .name = "dsv4_native", .flags = glue },
     .{ .name = "dsv4_text", .flags = glue },
+    .{ .name = "dsv4_batch", .flags = glue }, // ours: batched lane-round row table and rank-exchange glue (dsv4_vision/rounds.zig)
     .{ .name = "dsv4_tensor", .flags = glue },
     .{ .name = "attn_train", .flags = &.{"-O3"} },
     .{ .name = "qwen27_train", .flags = &.{"-O3"} },

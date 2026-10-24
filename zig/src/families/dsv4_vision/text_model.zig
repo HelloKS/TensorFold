@@ -7,6 +7,8 @@ const state = @import("text_state.zig");
 const runtime = @import("text_runtime.zig");
 const Link = @import("link.zig").Link;
 const exchange = cluster.exchange;
+const rg = @import("round_graph.zig");
+const graphs = @import("graphs.zig");
 pub const Model = struct {
     a: std.mem.Allocator,
     io: std.Io,
@@ -31,7 +33,14 @@ pub const Model = struct {
     media: std.AutoHashMapUnmanaged(u32, std.ArrayList(@import("vision_serving.zig").Span)) = .empty,
     proposed: [5]u32 = @splat(0),
     confidence: [5]f32 = @splat(0),
-    pub fn open(a: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, cache: []const u8, kernels: ?[]const u8, rank: u32, ip: [4]u8, port: u16, context: usize) !*Model {
+    rb: ?*@import("rounds.zig").Rounds = null,
+    kv8: bool = false, // --kv-cache fp8: e4m3 rows across this model's caches, and part of the identity its rank shares
+    dspark: bool = false, // the dspark window at open: those rounds start off the graphed path
+    wc: @import("window_cost.zig").Table = .{}, // the widths timed at open; an incomplete table keeps lane admission static
+    gr: ?*rg.Graphs = null, // TF_DSV4_GRAPHS decode rounds: rank-local execution, never a fingerprint byte
+    glive: [@import("rowtab.zig").cap_max]GLive = @splat(.{}),
+    const GLive = struct { slot: u32 = 0, token: u32 = 0 }; // the per-round refresh deferred stretches read live
+    pub fn open(a: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, dir: []const u8, cache: []const u8, kernels: ?[]const u8, rank: u32, ip: [4]u8, port: u16, context: usize, kv8: bool) !*Model {
         if (rank > 1 or context == 0 or context > 262144) return error.UnsupportedProfile;
         var arena: std.heap.ArenaAllocator = .init(a);
         defer arena.deinit();
@@ -44,11 +53,17 @@ pub const Model = struct {
             std.log.err("rank {d}: cache {t}: {s}", .{ rank, err, problem });
             return err;
         };
-        try @import("text_admission.zig").check(a, io, ctx, c, &local.tensors, context, rank);
+        try @import("text_admission.zig").check(a, io, ctx, c, &local.tensors, context, rank, kv8);
         var link = if (rank == 0) try Link.listen(ip, port) else try Link.connect(io, ip, port, 120);
         errdefer link.close();
         const identity = @import("text_identity.zig");
-        const execution = try runtime.fingerprint(a, io, kernels, c.storage);
+        const native = @import("native.zig");
+        const rd = @import("rounds.zig");
+        const batched = rd.modeFrom(native.env("TF_DSV4_BATCH"), native.env("TF_DSV4_SERIAL")) == .batched;
+        const rows_cap = try rd.capFromEnv(native.env("TF_DSV4_ROWS_CAP"));
+        const dspark = std.mem.eql(u8, native.env("TF_DSV4_DSPARK") orelse "0", "1");
+        const wc_on = std.mem.eql(u8, native.env("TF_DSV4_WC") orelse "1", "1");
+        const execution = try runtime.fingerprint(a, io, kernels, c.storage, batched, rows_cap, kv8, wc_on);
         const hello = try identity.encode(local.identity, execution, @intCast(context), rank);
         var peer: [72]u8 = undefined;
         if (rank == 0) {
@@ -72,7 +87,7 @@ pub const Model = struct {
         var ready: usize = 0;
         errdefer for (idle[0..ready]) |*seq| seq.free();
         for (&idle) |*seq| {
-            seq.* = try state.Sequence.init(a, ctx.d, c, context);
+            seq.* = try state.Sequence.init(a, ctx.d, c, context, kv8);
             ready += 1;
         }
         var freq: [2]cuda.DeviceBuffer = undefined;
@@ -83,6 +98,9 @@ pub const Model = struct {
             f.* = try cuda.DeviceBuffer.fromHost(ctx.d, std.mem.asBytes(&values));
             made += 1;
         }
+        var rb: ?*@import("rounds.zig").Rounds = null;
+        if (batched) rb = try @import("rounds.zig").Rounds.init(a, io, ctx.d, kernels, c.vocab_size, rows_cap);
+        errdefer if (rb) |x| x.free();
         const m = try a.create(Model);
         errdefer a.destroy(m);
         var done: [8]u8 = undefined;
@@ -94,8 +112,47 @@ pub const Model = struct {
             try link.send("ready-v1");
         }
         if (!std.mem.eql(u8, &done, "ready-v1")) return error.RankNotReady;
-        m.* = .{ .a = a, .io = io, .d = ctx.d, .c = c, .rank = rank, .context = context, .stream = s, .r = r, .w = w, .link = link, .comm = comm, .freq = freq, .idle = idle, .identity = @import("cache_key.zig").namespace(c.storage, local.identity, execution), .ctx = ctx };
+        m.* = .{ .a = a, .io = io, .d = ctx.d, .c = c, .rank = rank, .context = context, .stream = s, .r = r, .w = w, .link = link, .comm = comm, .freq = freq, .idle = idle, .identity = @import("cache_key.zig").namespace(c.storage, local.identity, execution), .rb = rb, .ctx = ctx, .kv8 = kv8, .dspark = dspark };
+        if (rb != null) {
+            const gs = try graphs.Settings.fromEnv(); // bad knobs fail the open, never a silent half-graphed rank
+            if (gs.on) {
+                m.gr = try a.create(rg.Graphs);
+                errdefer {
+                    m.gr.?.deinit();
+                    a.destroy(m.gr.?);
+                    m.gr = null;
+                }
+                m.gr.?.* = rg.Graphs.init(a, gs, rg.CudaPieces.pieces(), rg.nccl(&m.comm), null);
+                m.gr.?.agreement = try graphs.Agreement.init(ctx.d, &m.comm, m.stream);
+                m.gr.?.cache.agree = m.gr.?.agreement.?.agree();
+            }
+        }
+        if (wc_on) {
+            const wc = @import("window_cost.zig");
+            const capped = @min(@as(u32, @intCast(c.dspark_block_size)) +| 1, wc.max_width);
+            wc.measure(m, &m.wc, if (dspark) capped else 1) catch |err| std.log.warn("rank {d}: window costs stay static: {t}", .{ rank, err });
+        }
         return m;
+    }
+    pub fn now(m: *Model) u64 {
+        return @intCast(std.Io.Clock.awake.now(m.io).nanoseconds);
+    }
+    /// One timed pass over command-order rows: the batched verify when the plan allows it, the serial rows otherwise.
+    pub fn timeRows(m: *Model, rows: []const cluster.round.Row) !void {
+        if (m.rb) |rb| {
+            const rd = @import("rounds.zig");
+            var pl = rd.plan(m, rows, rb.rows_max);
+            if (pl.fallback == .none) {
+                try rd.verify(m, rd.Device, roundRow, &pl, null);
+                try m.sync();
+                return;
+            }
+        }
+        try forwardRows(m, rows, null);
+        try m.sync();
+    }
+    pub fn releaseRows(m: *Model, slot: u32) void {
+        release(m, slot);
     }
     pub fn sync(m: *Model) !void {
         const start = std.Io.Clock.awake.now(m.io).nanoseconds;
@@ -113,6 +170,7 @@ pub const Model = struct {
     }
     pub fn poison(m: *Model) void {
         m.failed = true;
+        if (m.gr) |g| g.dropAll(); // a poisoned rank replays nothing: every graph dies where its trust did
         m.comm.abort();
         m.link.shutdown();
     }
@@ -129,6 +187,12 @@ pub const Model = struct {
         m.media.deinit(m.a);
         for (m.idle[0..m.idle_n]) |*s| s.free();
         for (&m.freq) |*f| f.free();
+        if (m.gr) |g| {
+            g.deinit(); // execs reference the stream and every staged buffer: they die first
+            m.a.destroy(g);
+            m.gr = null;
+        }
+        if (m.rb) |x| x.free();
         m.w.free();
         m.r.free();
         m.stream.deinit();
@@ -163,6 +227,84 @@ pub const Model = struct {
         errdefer {
             m.poison();
         }
+        if (m.rb) |rb| {
+            const rd = @import("rounds.zig");
+            var pl = rd.plan(m, rows, rb.rows_max);
+            if (pl.fallback == .none) {
+                if (try graphRound(m, &pl)) return; // captured, replayed or cache-eager: the round ran
+                return rd.verify(m, rd.Device, roundRow, &pl, logits);
+            }
+        }
+        try forwardRows(m, rows, logits);
+    }
+    /// The graphed round: the plan's own audit, perf-kv's walk for the fingerprint, one engine call; true means it ran.
+    fn graphRound(m: *Model, pl: *const @import("rounds.zig").Plan) !bool {
+        const rd = @import("rounds.zig");
+        const g = m.gr orelse return false;
+        if (!pl.graphable or pl.n_sampled != 0) return false; // dspark and sampling rounds stay verify's
+        const rb = m.rb.?;
+        const rowtab = @import("rowtab.zig");
+        try rd.Device.stage(m, pl); // fresh rowtab bytes every round: positions never live inside a graph
+        var seqs: [rowtab.cap_max]*state.Sequence = undefined;
+        var total: usize = 10; // RoundAddrs' fixed registers
+        for (0..pl.n) |i| {
+            const seq = try m.sequence(pl.rows[i].slot);
+            if (seq.len != pl.rows[i].index) return error.PositionMismatch; // verify's audit, on the graphed path too
+            seqs[i] = seq;
+            m.glive[i] = .{ .slot = pl.rows[i].slot, .token = pl.rows[i].token };
+            total += seq.partCount() + 1;
+        }
+        var walks: [rowtab.cap_max]rg.SeqWalk = undefined;
+        for (0..pl.n) |i| walks[i] = .{ .ctx = seqs[i], .words = seqWords };
+        const set: rg.RoundAddrs = .{
+            .table = rb.table.ptr, .ids = rb.ids.ptr, .exch = rb.exch.ptr, .recv = rb.recv.ptr, .out = rb.out.ptr,
+            .kv = m.r.p(.kv), .gate = m.r.p(.gate), .up = m.r.p(.up), .selected = m.r.p(.selected),
+            .identity = rg.digestWord(m.identity), // the execution digest, kv8 gate included, folded to its word
+            .seqs = walks[0..pl.n],
+        };
+        const words = try m.a.alloc(u64, total);
+        defer m.a.free(words);
+        const fp = try set.fingerprint(words);
+        var run = GraphRun{ .m = m, .pl = pl };
+        const outcome = try g.runRound(pl.n, pl.last_pos, m.stream, fp, true, .{ .ctx = &run, .run = graphBody }) orelse return false; // null: the round stays ours, and verify's path runs it
+        switch (outcome) {
+            .captured, .replayed => {
+                for (0..pl.n) |i| seqs[i].len += 1; // the launch is the round's step: this is where rows advance
+                try m.sync();
+            },
+            .eager => {}, // the cache's eager pass advanced and drained inside each row itself
+        }
+        return true;
+    }
+    const GraphRun = struct { m: *Model, pl: *const @import("rounds.zig").Plan };
+    /// One round's program through the cache: rows in order, then the round's single allGather (cut when capturing).
+    fn graphBody(ctx: *anyopaque, rec: ?*rg.Recorder, collective: ?rg.Collective, stream: cuda.Stream) anyerror!void {
+        const b: *const GraphRun = @ptrCast(@alignCast(ctx));
+        const m = b.m;
+        const pl = b.pl;
+        const tf = @import("text_forward.zig");
+        var i: usize = 0;
+        while (i < pl.n) : (i += 1) {
+            const row = pl.rows[i];
+            const seq = try m.sequence(row.slot);
+            if (seq.len != row.index) return error.PositionMismatch;
+            try tf.bodyRec(m, seq, row.token, 0, .none, null, @intCast(i), rec);
+        }
+        const rb = m.rb.?;
+        const count: usize = @as(usize, pl.R) * rb.vh;
+        if (rec) |r| return r.cut(.{ .all_gather = .{ .send = rb.exch.ptr, .recv = rb.recv.ptr, .count = count, .dtype = .f32 } });
+        if (collective) |c| try c.allGather(c.ctx, rb.exch.ptr, rb.recv.ptr, count, .f32, stream) else try m.comm.allGather(rb.exch.ptr, rb.recv.ptr, count, .f32, m.stream);
+        try m.sync(); // Device.round's drain, mirrored: the exchange completes before the caller returns
+    }
+    /// F1's production half: the graphed step fingerprints through perf-kv's snapshot walk, per row's sequence.
+    fn seqWords(ctx: *anyopaque, out: []u64) anyerror!usize {
+        const s: *state.Sequence = @ptrCast(@alignCast(ctx));
+        return s.graphWords(out);
+    }
+    fn roundRow(m: anytype, seq: anytype, token: u32, sample: bool) anyerror!void {
+        try @import("text_forward.zig").body(m, seq, token, 0, if (sample) .partial else .none, null);
+    }
+    fn forwardRows(m: *Model, rows: []const cluster.round.Row, logits: ?[]f32) !void {
         var n: usize = 0;
         var r: usize = 0;
         while (r < rows.len) {

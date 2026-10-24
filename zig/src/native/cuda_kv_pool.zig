@@ -73,6 +73,7 @@ pub fn kept(comptime F: type, loaded: anytype, paged: ?Plan, o: api.Open, room: 
     if (host_mode) return .{ .snaps = 0, .copied = hostBudget(o, host_budget), .snap_bytes = stagingBytes(F, loaded, hostBudget(o, host_budget)), .host = true, .most = named(o) orelse std.math.maxInt(usize) };
     if (comptime !@hasDecl(F, "snap_slots")) return .{ .snaps = 0, .copied = if (@hasDecl(F, "snap_save")) budget.cacheBytes(o.prompt_cache_gib, room, held) else 0, .snap_bytes = 0 };
     const b: u64 = loaded.snap_bytes;
+    if (b == 0) return .{ .snaps = 0, .copied = budget.cacheBytes(o.prompt_cache_gib, room, held), .snap_bytes = 0 }; // slots declared, none charged yet: the whole cache stays copied rows
     const s = if (paged) |p| kv_pool.split(p.snaps * b + p.copied, b, p.snaps) else kv_pool.split(budget.cacheBytes(o.prompt_cache_gib, room, held), b, named(o));
     return .{ .snaps = s.snaps, .copied = s.copied, .snap_bytes = b };
 }
@@ -81,7 +82,7 @@ pub fn kept(comptime F: type, loaded: anytype, paged: ?Plan, o: api.Open, room: 
 pub fn store(comptime F: type, s: *api.prompt_cache.Store, target: anytype, k: Kept) !void {
     if (comptime !@hasDecl(F, "snap_slots")) return;
     if (comptime @hasDecl(F, "snap_place")) F.snap_place(target, k.host);
-    s.most = if (k.host) k.most else k.snaps;
+    s.most = if (k.host) k.most else if (k.snap_bytes == 0) s.most else k.snaps; // slots declared, none named yet: the store's own count stands; a budgeted 0 still zeroes it
     _ = try F.snap_slots(target, k.snaps);
 }
 
@@ -89,7 +90,8 @@ pub fn store(comptime F: type, s: *api.prompt_cache.Store, target: anytype, k: K
 pub fn text(comptime F: type, a: Allocator, stream_bytes: u64, l: ?kv_pool.Layout, paged: ?Plan, window: u64, k: Kept, kv8: bool) ![2][]const u8 {
     const shape = if (paged) |p| try std.fmt.allocPrint(a, "the engine's own at a {d}-token window ({d:.2} GiB, in the model's), {d} more taking {d} pages of {d} rows ({d:.2} GiB) as they need them, {d:.0} MiB fixed each", .{ window, toGib(stream_bytes), p.lanes - 1, p.pages, l.?.page_tokens, toGib(p.pages * l.?.pageBytes()), @as(f64, @floatFromInt(l.?.fixed_bytes)) / (1 << 20) }) else try std.fmt.allocPrint(a, "{d:.2} GiB each at a {d}-token window{s}", .{ toGib(stream_bytes), window, if (kv8) " (fp8 caches)" else "" });
     const placed = comptime @hasDecl(F, "snap_place"); // the startup line says where its prompt states went, and why
-    const cache = if (k.copied == 0) ", no prompt cache" else if (k.host) try std.fmt.allocPrint(a, ", {s}a {d:.1} GiB prompt cache in host memory with {d:.0} MiB of device staging", .{ if (placed) "prompt states on host, the cache doesn't fit on the card: " else "", toGib(k.copied), @as(f64, @floatFromInt(k.snap_bytes)) / (1 << 20) }) else if (comptime @hasDecl(F, "snap_slots")) try std.fmt.allocPrint(a, ", {s}a prompt cache of {d} snapshot slots ({d:.1} GiB) and {d:.1} GiB of copied rows", .{ if (placed) "prompt states on device: " else "", k.snaps, toGib(k.snaps * k.snap_bytes), toGib(k.copied) }) else try std.fmt.allocPrint(a, ", a {d:.1} GiB prompt cache", .{toGib(k.copied)});
+    const slots = if (comptime @hasDecl(F, "snap_slots")) k.snap_bytes != 0 else false; // none named yet: the cache stays whole, as a slots-less family's
+    const cache = if (k.copied == 0) ", no prompt cache" else if (k.host) try std.fmt.allocPrint(a, ", {s}a {d:.1} GiB prompt cache in host memory with {d:.0} MiB of device staging", .{ if (placed) "prompt states on host, the cache doesn't fit on the card: " else "", toGib(k.copied), @as(f64, @floatFromInt(k.snap_bytes)) / (1 << 20) }) else if (slots) try std.fmt.allocPrint(a, ", {s}a prompt cache of {d} snapshot slots ({d:.1} GiB) and {d:.1} GiB of copied rows", .{ if (placed) "prompt states on device: " else "", k.snaps, toGib(k.snaps * k.snap_bytes), toGib(k.copied) }) else try std.fmt.allocPrint(a, ", a {d:.1} GiB prompt cache", .{toGib(k.copied)});
     return .{ shape, cache };
 }
 
@@ -166,6 +168,43 @@ pub fn closeStore(gpa: Allocator, saved: *api.prompt_cache.Store) void {
     if (disk) |rows| rows.deinit();
 }
 
+test "kv slots: keep zero names no slots, zeroes the copied rows beside them, and says so on the startup line" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var ctx: u8 = 0;
+    var problem: []const u8 = "";
+    const l: kv_pool.Layout = .{ .fixed_bytes = 64 << 20, .token_bytes = 7 << 10, .page_tokens = 512, .snap_bytes = 48 << 20 };
+    const card = .{ .ctx = @as(*anyopaque, &ctx), .host_snaps = true, .snap_bytes = @as(u64, 48 << 20), .layout = @as(?kv_pool.Layout, l), .free_streams = @as(u32, 1) };
+    const asked: api.Open = .{ .dir = "", .model_type = "n", .lanes = 4, .prompt_cache_gib = 4, .keep = 0 };
+    const room = 12 << 30;
+    const paged = try plan(Placing, a, l, room, asked, 70000, &problem, false) orelse return error.NoPlan;
+    try std.testing.expectEqual(@as(usize, 0), paged.snaps); // keep 0 names no slots, exactly as named(o) says
+    const k = kept(Placing, card, paged, asked, room, 0, 0, false);
+    try std.testing.expectEqual(@as(usize, 0), k.snaps);
+    try std.testing.expectEqual(@as(u64, 0), k.copied); // core kv_pool.split's contract: no slot, no cache
+    try std.testing.expectEqual(paged.copied, k.copied); // the plan and the kept budget agree, both at zero
+    try std.testing.expectEqual(@as(u64, 48 << 20), k.snap_bytes); // the slot size stays charged: store()'s b != 0 guard takes the store's count to 0
+    try std.testing.expect(std.mem.startsWith(u8, (try text(Placing, a, 1 << 30, l, paged, 70000, k, false))[1], ", no prompt cache")); // keep 0 says so on the startup line
+    const off = .{ .ctx = @as(*anyopaque, &ctx), .host_snaps = false, .snap_bytes = @as(u64, 0), .layout = @as(?kv_pool.Layout, null), .free_streams = @as(u32, 1) };
+    const plain = kept(Placing, off, null, asked, room, 0, 0, false); // the pool unnamed: the b==0 line, byte for byte as a slots-less family
+    try std.testing.expectEqual(@as(usize, 0), plain.snaps);
+    try std.testing.expectEqual(budget.cacheBytes(asked.prompt_cache_gib, room, 0), plain.copied);
+    try std.testing.expectEqual(@as(u64, 0), plain.snap_bytes); // snap_bytes==0 is the guard that leaves store().most standing
+}
+test "kv placement: no slots named reads as a whole cache, whether the family has none or the pool was never named" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const Rows = struct { pub const snap_save = 1; }; // a family with no slots at all: today's line
+    const l: kv_pool.Layout = .{ .fixed_bytes = 64 << 20, .token_bytes = 7 << 10, .page_tokens = 512, .snap_bytes = 48 << 20 };
+    const plain = (try text(Rows, a, 1 << 30, null, null, 70000, .{ .snaps = 0, .copied = 4 << 30, .snap_bytes = 0 }, false))[1];
+    try std.testing.expect(std.mem.startsWith(u8, plain, ", a 4.0 GiB prompt cache"));
+    const off = (try text(Placing, a, 1 << 30, l, null, 70000, .{ .snaps = 0, .copied = 4 << 30, .snap_bytes = 0 }, false))[1]; // TF_DSV4_KV_PAGES off
+    try std.testing.expect(std.mem.startsWith(u8, off, ", a 4.0 GiB prompt cache")); // no slot budget was named: the line must not claim one
+    const on = (try text(Placing, a, 1 << 30, l, null, 70000, .{ .snaps = 8, .copied = 1 << 30, .snap_bytes = 48 << 20 }, false))[1];
+    try std.testing.expect(std.mem.startsWith(u8, on, ", prompt states on device: a prompt cache of 8 snapshot slots"));
+}
 test "kv safety: native planning refuses insufficient staging and allocates at or above the room" {
     try @import("cuda_kv_safety_test.zig").run(@This(), false);
 }

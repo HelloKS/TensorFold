@@ -13,7 +13,7 @@ pub fn absorb(m: anytype, seq: *st.Sequence, pos: u32) !void {
         const p = try fw.key(&b, "mtp.{d}", .{i});
         try m.r.buf(.norm).copyFrom(0, seq.main.ptr, m.c.hidden_size * 2, m.stream.handle);
         try fw.keyValue(m, p, pos, false);
-        try layer.kv.copyFrom(@as(usize, pos % m.c.sliding_window) * m.c.head_dim * 2, m.r.p(.kv), m.c.head_dim * 2, m.stream.handle);
+        try fw.writeRow(m, layer.kv, @as(usize, pos % m.c.sliding_window) * fw.rowBytes(m, m.c.head_dim), m.r.p(.kv), m.c.head_dim);
     }
 }
 
@@ -74,13 +74,21 @@ pub fn propose(m: anytype, seq: *st.Sequence, token: u32, out: []u32) !void {
             try queries.copyFrom(i * qbytes, m.r.p(.q), qbytes, m.stream.handle);
             try keys.copyFrom(i * kvbytes, m.r.p(.kv), kvbytes, m.stream.handle);
         }
-        try layer.kv.copyFrom(m.c.sliding_window * kvbytes, keys.ptr, size * kvbytes, m.stream.handle);
+        if (m.kv8) { // the block's rows join the draft cache as e4m3: one q8 a row, from the BF16 scratch the queries drew into
+            for (0..size) |i| try m.r.text.call("q8", m.stream, 1, @intCast(m.c.head_dim), .{ keys.ptr + i * kvbytes, layer.kv.ptr + (m.c.sliding_window + i) * fw.rowBytes(m, m.c.head_dim), @as(u32, @intCast(m.c.head_dim)) });
+        } else try layer.kv.copyFrom(m.c.sliding_window * kvbytes, keys.ptr, size * kvbytes, m.stream.handle);
         for (0..size) |i| {
             try m.r.buf(.h).copyFrom(0, block.ptr + i * hbytes, hbytes, m.stream.handle);
             try fw.hc(m, p, "attn");
             try m.r.buf(.q).copyFrom(0, queries.ptr + i * qbytes, qbytes, m.stream.handle);
             const sink = try m.w.ptr(try fw.key(&b, "{s}.attn.attn_sink", .{p}));
-            try m.r.operators.model.sparse(m.stream, m.r.p(.q), layer.kv.ptr, m.r.p(.selected), sink, m.r.p(.attn),
+            var read = layer.kv.ptr;
+            if (m.kv8) { // the draft reads its window and block rows back as BF16, the same staging the target's sparse uses
+                const rows = seq.staging orelse return error.MissingStaging;
+                try m.r.text.call("gather8", m.stream, @intCast(past + size), 256, .{ layer.kv.ptr, m.r.p(.selected), rows.ptr, @as(u32, @intCast(past + size)), @as(u32, @intCast(m.c.head_dim)), @as(u32, @intCast(fw.rowBytes(m, m.c.head_dim))) });
+                read = rows.ptr;
+            }
+            try m.r.operators.model.sparse(m.stream, m.r.p(.q), read, m.r.p(.selected), sink, m.r.p(.attn),
                 .{ .rows = 1, .heads = @intCast(m.c.num_attention_heads / 2), .selected = @intCast(past + size), .dim = @intCast(m.c.head_dim) });
             try fw.outputProjection(m, p, seq.len + @as(u32, @intCast(i)), false);
             try fw.post(m);

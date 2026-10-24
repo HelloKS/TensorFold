@@ -66,10 +66,12 @@ export TF_DSV4_WORKER_RECEIPT=validation-rank1.json
 zig-out/bin/tf-dsv4-worker /models/dsv4-original 262144 "$TF_DSV4_KERNELS"
 ```
 
-A peer that dies today costs up to the ~10 s control timeout (the `TF_TP` control
-deadline / `PeerTimeout`). Upstream's rank contract stops a rank in ~1 s with a
-named peer on `cuda.tp_watch`, which this path does not use yet; that faster peer
-watch is a documented gap and a follow-up.
+A peer that dies on the default path costs up to the ~10 s control timeout
+(the `TF_TP` control deadline / `PeerTimeout`). The `TF_DSV4_WATCH=1` opt-in
+below wires this path to upstream's rank contract — a named peer on
+`cuda.tp_watch` that stops a rank in ~1 s — which `tf-dsv4-worker` does not
+use by default yet; the two-Spark peer-kill qualification pass below covers
+it before it becomes the deployment default.
 
 On rank 0:
 
@@ -101,6 +103,99 @@ Vision runs on rank 0 and sends final BF16 spans to rank 1. Each span prefills
 by layer so queries can see the entire same image; compression/indexer paths
 remain causal. Chunk and snapshot boundaries do not split an image.
 
+## Performance opt-ins (default off)
+
+The default path keeps the reference semantics: serial rows within shared lane
+rounds, NCCL for every rank exchange, bf16 caches, per-sequence KV windows and
+host-side snapshots. Each setting below opts into a faster path — except
+`TF_DSV4_WC`, which is on by default and documented here for its opt-out — and
+none is hardware-qualified yet, so the qualification pass below must measure
+them before any becomes a deployment default.
+
+`TF_DSV4_BATCH=1` — set on both ranks. Several streams' rows share one verify
+and one FP32 rank exchange per lane round instead of running serially. Both
+ranks derive the round plan identically from the broadcast rows, and the wire
+is unchanged: no new command kinds, so mixed-version ranks still speak.
+`TF_DSV4_ROWS_CAP` caps a round at a bucketed row count (default 24);
+`TF_DSV4_SERIAL=1` forces the serial path as the fail-safe. Batched and serial
+runs are token-identical in the host fixtures.
+
+`TF_DSV4_KV_PAGES=1` — set on both ranks. The streams' KV comes from one page
+pool on the shared core page layout: streams beyond the engine's own window
+take pages as needed, kept prompt states become budget-sized slots, and when
+the asked prompt cache does not fit beside the streams the states go to pinned
+host memory instead of refusing. Unset, each stream keeps its own full window
+and the startup accounting reads exactly as before.
+
+`--kv-cache fp8` on rank 0 with `TF_DSV4_KV8=1` on rank 1 — KV rows are stored
+as e4m3 codes with one FP32 scale per row (516 bytes per 512-wide row, about
+half the cache bytes); the sparse gather dequantizes selected rows into a
+per-sequence BF16 staging buffer. The cache width is part of the rank identity
+digest: a pair that disagrees on it refuses with `RankIdentityMismatch` rather
+than mixing row shapes. The fp8 kernels compile in the family's kernel section
+and their nvcc verification belongs to the qualification pass.
+
+`TF_DSV4_WC` — defaults ON; set `TF_DSV4_WC=0` on both ranks for the static
+admission arithmetic. At open the family measures per-row-width forward costs
+(two warm plus one timed pass per width on scratch slots, at most six widths
+with DSpark) and feeds the lane scheduler measured costs instead of estimates,
+the same boot-time calibration the other CUDA lane families run by default.
+Any failed measurement warns and falls back to the static arithmetic — boot is
+never blocked. The setting is part of the rank identity digest: a measuring
+rank and a silent rank refuse each other rather than admitting lanes under
+different costs.
+
+`TF_DSV4_P2P=1` — set on both ranks (rank 0 server and rank 1 worker). After
+the NCCL bootstrap the ranks exchange staging handles over the command link
+(the `TFP2P2` offer and `P2PA` ack); the FP32 expert partial all-add then runs
+over CUDA IPC staging — two sequence-parity slots and a mailbox with stream
+memop doorbells — instead of an NCCL all-gather and local add. Requires peer
+access in both directions and stream memop support; any decline, missing
+symbol, failed mapping or vote timeout falls back to NCCL on both ranks,
+quietly, at open. Every round within the 24-row cap fits the staging; larger
+exchanges fall back on both ranks together. Mixed versions fail loud: an old
+follower meeting the new offer refuses at startup (upgrade both ranks
+together), while a new follower behind an old leader waits at most 2 s and
+then uses NCCL. A mid-stream P2P failure poisons the communicator rather than
+rerouting one round — a split sequence is communicator death.
+
+`TF_DSV4_ROCE=1` — set on both ranks, and `TF_ROCE` must satisfy the shared
+RoCE requirement (`cuda/roce.zig`; interface selection via `TF_ROCE_HCA` /
+`NCCL_IB_HCA`). The probe frame carries a roce vote; on agreement the first
+all-gather lazily brings up the RoCE group, where the hardware truth votes
+inside the shared transport's NCCL swap and both ranks reach that decision
+together. A one-rank env split aborts loudly by design — there is no silent
+half-RDMA. Either side declining (no HCA, unmet `TF_ROCE`) leaves both ranks
+on the typed `ncclAllGather`, byte-identical to the default.
+
+`TF_DSV4_WATCH=1` — set on both ranks. Opens the shared `cuda.tp_watch`
+liveness lines **before** the NCCL communicator is initialized, at the master
+host with the command port plus one (derived from the link's bind address),
+so any rank's abort or death stops every rank in about one second — through
+an error record or the line close — instead of waiting on the socket
+deadline; a clean deinit is an expected close and stops nobody. Requires the
+derived port to be free on the rank-0 host. Unset: no lines, no environment
+writes, no watch threads, no added time, and the peer-death semantics above
+are exactly as before.
+
+`TF_DSV4_GRAPHS=1` — set on both ranks. Captures the batched decode round
+(only rounds the batched path can fuse and that take no samples — sampled and
+DSpark speculative rounds always stay eager) keyed by row and context bucket,
+cut at the NCCL collective: one capture per shape, replayed on hits, a failed
+capture falls to eager permanently. The replay is collective-identical to the
+eager round — same single all-gather, same sync — so ranks never diverge in
+rank order and the flag needs no identity byte. Any address the round bakes
+(KV rows, exchange registers, the fp8 staging buffer, the identity digest)
+entering a new epoch drops every graph and recaptures, and any communicator
+poison drops the cache too; per-round values re-run live, never baked.
+Tuning knobs (defaults chosen for the two-Spark shape): `TF_DSV4_GRAPHS_MAX`
+captured shapes, `TF_DSV4_GRAPH_BUCKET` / `TF_DSV4_GRAPH_BUCKET_GROW` shape
+bucketing, `TF_DSV4_GRAPH_ROWS_MAX`, `TF_DSV4_GRAPH_FLOOR=hold|shed` memory
+policy with `TF_DSV4_GRAPH_FLOOR_GIB` / `TF_DSV4_GRAPH_COST_MIB` bounds.
+Unset: zero captures, zero fingerprint cost, the exact pre-flag program.
+Capture and replay execution semantics are compile-verified only on this
+build host — the qualification pass below owns the device half.
+
 ## Cache, rollback and memory
 
 The normal prefix store owns snapshot identity, lookup, borrowing and eviction.
@@ -123,8 +218,9 @@ image rows, draft state, staging/scratch and OS reserve. Host memory counts
 on unified-memory Sparks. An oversized context/concurrency is refused; the
 server does not silently reduce the requested 256K × 4 profile.
 
-The reference graph processes rows serially within shared lane rounds. No CUDA
-Graph, fused batching or alternate RDMA optimization is enabled by this port.
+By default the port keeps the reference semantics: rows run serially within
+shared lane rounds and NCCL gathers every round. The opt-ins above add batched
+rounds and the P2P all-add; CUDA Graph replay and an RDMA transport remain off.
 
 ## Hardware token-ID qualification
 

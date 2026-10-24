@@ -46,7 +46,7 @@ pub fn main(init: std.process.Init) !u8 {
         for (items, specs) |*item, spec| item.* = .{ .spec = spec, .ranks = .{ try parallel.partition(c, spec, 0), try parallel.partition(c, spec, 1) } };
         const physical = try payloads.select(a, c, headers);
         const rank_bytes = [2]payloads.RankBytes{ try payloads.memory(a, physical, 0), try payloads.memory(a, physical, 1) };
-        const json = try std.json.Stringify.valueAlloc(a, .{ .version = 2, .cache_code_sha256 = std.fmt.bytesToHex(@import("cache_abi.zig").digest(), .lower), .memory_qualified = false, .serving_backend_complete = false, .storage = c.storage.name(), .payloads = physical, .weight_memory = rank_bytes, .items = items, .kv_memory = try parallel.Memory.calculate(c, 262144, 4), .summary = summary }, .{});
+        const json = try std.json.Stringify.valueAlloc(a, .{ .version = 2, .cache_code_sha256 = std.fmt.bytesToHex(@import("cache_abi.zig").digest(), .lower), .memory_qualified = false, .serving_backend_complete = false, .storage = c.storage.name(), .payloads = physical, .weight_memory = rank_bytes, .items = items, .kv_memory = try parallel.Memory.calculate(c, 262144, 4, false), .kv_memory_fp8 = try parallel.Memory.calculate(c, 262144, 4, true), .summary = summary }, .{});
         try std.Io.File.stdout().writeStreamingAll(init.io, json);
         return 0;
     }

@@ -46,23 +46,26 @@ pub const Memory = struct {
     compressor_bytes: u64,
     draft_bytes: u64,
 
-    pub fn calculate(c: Config, context: usize, streams: usize) !Memory {
+    pub fn calculate(c: Config, context: usize, streams: usize, fp8: bool) !Memory {
         if (context == 0 or context > @import("config.zig").default_context or streams == 0 or streams > 4)
             return error.UnsupportedProfile;
+        const rows = @import("state_plan.zig").rowBytes;
+        const row = rows(c.head_dim, fp8); // an e4m3 row and its FP32 scale, or the bf16 halves
+        const indexed = rows(c.index_head_dim, fp8);
         var cache: u64 = 0;
         var compressor: u64 = 0;
         for (c.compress_ratios[0..c.num_hidden_layers]) |ratio| {
-            cache += c.sliding_window * c.head_dim * 2;
+            cache += c.sliding_window * row;
             if (ratio == 0) continue;
-            cache += (context / ratio) * c.head_dim * 2;
+            cache += (context / ratio) * row;
             const overlap: u64 = if (ratio == 4) 2 else 1;
             compressor += overlap * ratio * overlap * c.head_dim * 4 * 2;
             if (ratio == 4) {
-                cache += (context / ratio) * c.index_head_dim * 2;
+                cache += (context / ratio) * indexed;
                 compressor += 2 * ratio * 2 * c.index_head_dim * 4 * 2;
             }
         }
-        const draft = c.num_nextn_predict_layers * c.sliding_window * c.head_dim * 2;
+        const draft = c.num_nextn_predict_layers * c.sliding_window * row;
         return .{ .context = context, .streams = streams, .cache_bytes = cache * streams, .compressor_bytes = compressor * streams, .draft_bytes = draft * streams };
     }
 
@@ -86,8 +89,12 @@ test "expert and attention TP2 slices do not mix Hadamard blocks" {
 
 test "the KV estimate scales with streams and rejects a silent profile downgrade" {
     const c = try Config.parse(std.testing.allocator, @import("config.zig").fixture);
-    const one = try Memory.calculate(c, 262144, 1);
-    const four = try Memory.calculate(c, 262144, 4);
+    const one = try Memory.calculate(c, 262144, 1, false);
+    const four = try Memory.calculate(c, 262144, 4, false);
     try std.testing.expectEqual(one.total() * 4, four.total());
-    try std.testing.expectError(error.UnsupportedProfile, Memory.calculate(c, 1048576, 4));
+    try std.testing.expectError(error.UnsupportedProfile, Memory.calculate(c, 1048576, 4, false));
+    const fp8_rows = try Memory.calculate(c, 262144, 1, true); // --kv-cache fp8 buys back room, never spends it
+    try std.testing.expect(fp8_rows.cache_bytes < one.cache_bytes);
+    try std.testing.expectEqual(one.compressor_bytes, fp8_rows.compressor_bytes); // the rings stay FP32
+    try std.testing.expect(fp8_rows.draft_bytes < one.draft_bytes);
 }

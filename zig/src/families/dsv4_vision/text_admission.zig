@@ -1,20 +1,26 @@
 //! Conservative TP2 admission includes the rank payload, four sequences, conversion/staging and shared host memory.
 const std = @import("std");
 const cuda = @import("cuda");
-pub fn check(a: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, c: @import("config.zig").Config, cat: *const @import("catalog.zig").Catalog, context: usize, rank: u32) !void {
+pub fn check(a: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, c: @import("config.zig").Config, cat: *const @import("catalog.zig").Catalog, context: usize, rank: u32, kv8: bool) !void {
     var payload: u64 = 0;
     for (cat.headers.values()) |t| payload += t.end - t.begin;
-    const state = try @import("parallel.zig").Memory.calculate(c, context, 4);
-    const rollback = 4 * (c.dspark_block_size + 1) * try @import("state_plan.zig").bytes(c, 0, true);
+    const plan = @import("state_plan.zig");
+    const state = try @import("parallel.zig").Memory.calculate(c, context, 4, kv8); // e4m3 rows are narrower, and admission books what the engine actually makes
+    const rollback = 4 * (c.dspark_block_size + 1) * try plan.bytes(c, 0, true, kv8);
     const image_rows = 4 * 4 * c.vision_max_n_token * c.hidden_size * 2;
-    const sequences = state.total() + rollback + image_rows + (c.num_hidden_layers + c.num_nextn_predict_layers) * c.vision_max_n_token * c.head_dim * 2 * 4;
+    const sequences = state.total() + rollback + image_rows + (c.num_hidden_layers + c.num_nextn_predict_layers) * c.vision_max_n_token * plan.rowBytes(c.head_dim, kv8) * 4;
     const scratch_stage: u64 = 2 << 30;
-    const need = payload + sequences + scratch_stage;
+    const rd = @import("rounds.zig");
+    const nt = @import("native.zig");
+    const round_bytes: u64 = if (rd.modeFrom(nt.env("TF_DSV4_BATCH"), nt.env("TF_DSV4_SERIAL")) == .batched)
+        rd.Rounds.bytes(try rd.capFromEnv(nt.env("TF_DSV4_ROWS_CAP")), c.vocab_size)
+    else 0;
+    const need = payload + sequences + scratch_stage + round_bytes;
     const pool = try inspect(a, io, ctx);
     const granted = pool.room;
     const reserve = pool.reserve;
     const available = pool.available;
-    std.log.info("rank {d} admission: payload {d}, 4 sequence states {d}, conversion/scratch/staging {d}, reserve {d}, available {d} bytes", .{ rank, payload, sequences, scratch_stage, reserve, available });
+    std.log.info("rank {d} admission: payload {d}, 4 sequence states {d}, conversion/scratch/staging {d}, batched rounds {d}, reserve {d}, available {d} bytes", .{ rank, payload, sequences, scratch_stage, round_bytes, reserve, available });
     if (need > granted) return error.MemoryBudgetExceeded;
 }
 const Pool = struct { available: u64, reserve: u64, room: u64 };

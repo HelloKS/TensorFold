@@ -15,7 +15,8 @@ pub fn main(init: std.process.Init) !u8 {
     defer ctx.deinit();
     const native = @import("native.zig");
     const context = try std.fmt.parseInt(usize, args[2], 10);
-    const m = try @import("text_model.zig").Model.open(a, init.io, &ctx, args[1], try native.cacheDir(), args[3], 1, try native.master(), try native.port(), context);
+    const kv8 = std.mem.eql(u8, native.env("TF_DSV4_KV8") orelse "0", "1"); // rank 1 takes the cache width from the same gate the harness sets on both ranks
+    const m = try @import("text_model.zig").Model.open(a, init.io, &ctx, args[1], try native.cacheDir(), args[3], 1, try native.master(), try native.port(), context, kv8);
     var live = true;
     defer if (live) m.close();
     const bytes = try a.alloc(u8, @import("control.zig").limit + 64);

@@ -18,6 +18,11 @@ pub const media = @import("media.zig");
 pub const vision_graph = @import("vision_graph.zig");
 pub const gpu_weights = @import("gpu_weights.zig");
 pub const cache_key = @import("cache_key.zig");
+pub const kv_pages = @import("kv_pages.zig");
+pub const graphs = @import("graphs.zig");
+pub const round_graph = @import("round_graph.zig");
+pub const rowtab = @import("rowtab.zig");
+pub const rounds = @import("rounds.zig");
 
 test {
     _ = storage;
@@ -40,4 +45,13 @@ test {
     _ = vision_graph;
     _ = media;
     _ = cache_key;
+    _ = kv_pages;
+    _ = @import("kv_pages_test.zig");
+    _ = graphs;
+    _ = round_graph;
+    _ = @import("round_graph_test.zig");
+    _ = rowtab;
+    _ = rounds;
+    _ = @import("rounds_test.zig");
+    _ = @import("rounds_ranks_test.zig");
 }

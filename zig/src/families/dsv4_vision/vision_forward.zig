@@ -24,13 +24,13 @@ pub fn run(m: anytype, seq: *state.Sequence, span: Span, rows: anytype, logits: 
             try m.r.buf(.h).copyFrom(0, hidden.ptr + j * hbytes, hbytes, m.stream.handle);
             try fw.hc(m, p, "attn");
             try fw.keyValue(m, p, span.start + @as(u32, @intCast(j)), m.c.compress_ratios[i] > 0);
-            try layer.kv.copyFrom((m.c.sliding_window + j) * m.c.head_dim * 2, m.r.p(.kv), m.c.head_dim * 2, m.stream.handle);
+            try fw.writeRow(m, layer.kv, (m.c.sliding_window + j) * fw.rowBytes(m, m.c.head_dim), m.r.p(.kv), m.c.head_dim);
         }
         for (rows, 0..) |row, j| {
             if (row.index != span.start + j or row.token < m.c.vocab_size or (row.sample and j + 1 != count)) return error.InvalidImageSpan;
             try m.r.buf(.h).copyFrom(0, hidden.ptr + j * hbytes, hbytes, m.stream.handle);
             try fw.hc(m, p, "attn");
-            try fw.attention(m, p, layer, row.index, m.c.compress_ratios[i], .{ .start = span.start, .end = span.end });
+            try fw.attention(m, p, layer, seq, row.index, m.c.compress_ratios[i], .{ .start = span.start, .end = span.end });
             try fw.post(m);
             try fw.hc(m, p, "ffn");
             try fw.moe(m, p, false, true);

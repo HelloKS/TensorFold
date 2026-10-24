@@ -1,6 +1,7 @@
 // Text graph glue for the pinned DeepSeek V4 reference; activations stay BF16, accumulations stay FP32.
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include "kv_fp8.cuh" // the shared e4m3 row quantization --kv-cache fp8 stores the cache in
 #include <stdint.h>
 #include <math.h>
 __device__ float get(const void* p, unsigned i, unsigned kind) {
@@ -61,6 +62,39 @@ extern "C" __global__ void tf_dsv4_text_index(const __nv_bfloat16* q,const __nv_
   for(unsigned h=0;h<heads;h++) {float dot=0;for(unsigned d=0;d<dim;d++)dot+=__bfloat162float(q[h*dim+d])*__bfloat162float(kv[key*dim+d]);
     sum+=bf(fmaxf(bf(dot),0)*bf(__bfloat162float(weights[h])*scale));}
   out[key]=bf(sum);
+}
+// ---- 8-bit KV rows (--kv-cache fp8): e4m3 codes and one FP32 scale a row, exactly as kv_fp8.cuh quantizes them. ----
+extern "C" __global__ void tf_dsv4_text_q8(const __nv_bfloat16* x, unsigned char* row, uint32_t dim) {
+  __shared__ float red[32];
+  unsigned d = threadIdx.x;
+  float v = __bfloat162float(x[d]);
+  if (dim == 512) tf_kv_fp8::quant_row<512>(v, d, row, reinterpret_cast<float*>(row + dim), red);
+  else tf_kv_fp8::quant_row<128>(v, d, row, reinterpret_cast<float*>(row + dim), red);
+}
+// An 8-bit cache row as BF16 again: every code times its row's scale; the block covers the row, one thread a value.
+extern "C" __global__ void tf_dsv4_text_gather8(const unsigned char* rows, const int32_t* at,
+    __nv_bfloat16* out, uint32_t count, uint32_t dim, uint32_t stride) {
+  unsigned i = blockIdx.x; if (i >= count) return;
+  const unsigned char* src = rows + (size_t)at[i] * stride;
+  float scale = *reinterpret_cast<const float*>(src + dim);
+  for (unsigned d = threadIdx.x; d < dim; d += blockDim.x)
+    out[(size_t)i * dim + d] = __float2bfloat16_rn(__half2float(__half(__nv_cvt_fp8_to_halfraw(src[d], __NV_E4M3))) * scale);
+}
+// The sparse index's scores over 8-bit key rows: tf_dsv4_text_index's FP32 accumulation, read through each row's scale.
+extern "C" __global__ void tf_dsv4_text_index8(const __nv_bfloat16* q, const unsigned char* rows,
+    const __nv_bfloat16* weights, float* out, uint32_t count, uint32_t heads, uint32_t dim, uint32_t stride) {
+  unsigned key = blockIdx.x * blockDim.x + threadIdx.x; if (key >= count) return;
+  float sum = 0;
+  float scale = rsqrtf(float(dim)) * rsqrtf(float(heads * 2));
+  const unsigned char* row = rows + (size_t)key * stride;
+  const float row_scale = *reinterpret_cast<const float*>(row + dim);
+  for (unsigned h = 0; h < heads; h++) {
+    float dot = 0;
+    for (unsigned d = 0; d < dim; d++)
+      dot += __bfloat162float(q[h * dim + d]) * (__half2float(__half(__nv_cvt_fp8_to_halfraw(row[d], __NV_E4M3))) * row_scale);
+    sum += bf(fmaxf(bf(dot), 0) * bf(__bfloat162float(weights[h]) * scale));
+  }
+  out[key] = bf(sum);
 }
 extern "C" __global__ void tf_dsv4_text_cast(const void* x,float* y,uint32_t count,uint32_t kind) {
   unsigned i=blockIdx.x*blockDim.x+threadIdx.x;if(i<count)y[i]=get(x,i,kind);

@@ -19,7 +19,7 @@ pub fn tests(b: *std.Build, core: *std.Build.Module, cuda: *std.Build.Module, al
         .target = b.graph.host,
         .optimize = .debug,
         .link_libc = true,
-        .imports = &.{ .{ .name = "core", .module = core }, .{ .name = "cuda", .module = cuda } },
+        .imports = &.{ .{ .name = "core", .module = core }, .{ .name = "cuda", .module = cuda }, .{ .name = "cluster_backend", .module = cluster_tests.root_module }, .{ .name = "lanes", .module = lanes } },
     });
     const run = b.addRunArtifact(b.addTest(.{ .root_module = family }));
     b.step("test-dsv4-vision", "DeepSeek-V4 Flash Vision host tests (no model weights or GPU)").dependOn(&run.step);
@@ -76,7 +76,7 @@ pub fn nativeTargets(b: *std.Build, target: std.Build.ResolvedTarget, core: *std
         .target = target,
         .optimize = .safe,
         .link_libc = true,
-        .imports = &.{ .{ .name = "core", .module = core }, .{ .name = "cuda", .module = cuda } },
+        .imports = &.{ .{ .name = "core", .module = core }, .{ .name = "cuda", .module = cuda }, .{ .name = "lanes", .module = lanes }, .{ .name = "cluster_backend", .module = cluster_backend } },
     }) });
     b.step("check-dsv4-target", "Compile the model storage and cache contract tests for the target").dependOn(&contracts.step);
     const vision = visionExecutable(b, target, core, cuda, "tf-dsv4-vision");

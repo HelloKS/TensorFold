@@ -51,10 +51,10 @@ pub fn frequencies(c: @import("config.zig").Config, compressed: bool) [32]f32 {
     }
     return out;
 }
-pub fn fingerprint(a: std.mem.Allocator, io: std.Io, dir: ?[]const u8, storage: @import("storage.zig").Storage) ![32]u8 {
+pub fn fingerprint(a: std.mem.Allocator, io: std.Io, dir: ?[]const u8, storage: @import("storage.zig").Storage, batched: bool, rows_cap: u32, kv8: bool, wc: bool) ![32]u8 {
     var sha = std.crypto.hash.sha2.Sha256.init(.{});
     sha.update("dsv4-multimodal-dspark-tp2/v2");
-    inline for (.{ "text_forward.zig", "text_runtime.zig", "text_weights.zig", "text_state.zig", "text_model.zig", "text_identity.zig", "comm.zig", "link.zig", "state_plan.zig", "control.zig", "distributed_state.zig", "dspark.zig", "vision_forward.zig", "vision_serving.zig", "serving.zig", "native.zig", "text_admission.zig", "vision_graph.zig", "media.zig", "image_layout.zig", "picture.zig", "rgb.zig", "png.zig", "jpeg.zig", "weights.zig", "parallel.zig", "config.zig", "storage.zig", "image_cache.zig" }) |file| {
+    inline for (.{ "text_forward.zig", "text_runtime.zig", "text_weights.zig", "text_state.zig", "text_model.zig", "text_identity.zig", "comm.zig", "link.zig", "state_plan.zig", "control.zig", "distributed_state.zig", "dspark.zig", "vision_forward.zig", "vision_serving.zig", "serving.zig", "native.zig", "text_admission.zig", "vision_graph.zig", "media.zig", "image_layout.zig", "picture.zig", "rgb.zig", "png.zig", "jpeg.zig", "weights.zig", "parallel.zig", "config.zig", "storage.zig", "image_cache.zig", "rowtab.zig", "rounds.zig", "graphs.zig", "round_graph.zig", "kv_pages.zig", "window_cost.zig" }) |file| {
         const source = @embedFile(file);
         for (source, 0..) |byte, i| {
             if (byte == '\r' and i + 1 < source.len and source[i + 1] == '\n') continue;
@@ -73,7 +73,36 @@ pub fn fingerprint(a: std.mem.Allocator, io: std.Io, dir: ?[]const u8, storage: 
             } else sha.update(@field(cuda.kernels, name));
         }
     }
+    var gate: [16]u8 = undefined; // the round's own gates: batched or serial, its row cap, the cache's row width, and the open-time cost measurement
+    std.mem.writeInt(u32, gate[0..4], @as(u32, @intFromBool(batched)), .little);
+    std.mem.writeInt(u32, gate[4..8], rows_cap, .little);
+    std.mem.writeInt(u32, gate[8..12], @as(u32, @intFromBool(kv8)), .little); // an fp8 rank and a bf16 rank must never form a pair
+    std.mem.writeInt(u32, gate[12..16], @as(u32, @intFromBool(wc)), .little); // measuring ranks mirror passes; a measuring and a silent rank would desync
+    sha.update(&gate);
+    if (batched) {
+        if (dir) |path| {
+            const file = try std.fs.path.join(a, &.{ path, "dsv4_batch.fatbin" });
+            defer a.free(file);
+            const image = try std.Io.Dir.cwd().readFileAlloc(io, file, a, .limited(64 << 20));
+            defer a.free(image);
+            sha.update(image);
+        } else if (@hasDecl(cuda.kernels, "dsv4_batch")) sha.update(cuda.kernels.dsv4_batch);
+    }
     return sha.finalResult();
+}
+
+test "the execution identity covers the cache's row width, so an fp8 rank and a bf16 rank cannot form a pair" {
+    var arena: std.heap.ArenaAllocator = .init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const storage: @import("storage.zig").Storage = .native_fp4_fp8;
+    const wide = try fingerprint(a, std.testing.io, null, storage, false, 0, true, false);
+    const plain = try fingerprint(a, std.testing.io, null, storage, false, 0, false, false);
+    try std.testing.expect(!std.mem.eql(u8, &wide, &plain)); // identity.validate answers RankIdentityMismatch for a pair that differs only here
+    const again = try fingerprint(a, std.testing.io, null, storage, false, 0, true, false);
+    try std.testing.expectEqualSlices(u8, &wide, &again); // the same gates hash the same: the refusal is the flag, never the digest drifting
+    const measured = try fingerprint(a, std.testing.io, null, storage, false, 0, true, true);
+    try std.testing.expect(!std.mem.eql(u8, &wide, &measured)); // a measuring rank and a silent rank must never form a pair either
 }
 
 test "plain and compressed YaRN frequencies match the pinned official float32 reference" {

@@ -4,6 +4,57 @@ const cuda = @import("cuda");
 const st = @import("text_state.zig");
 const gpu = @import("gpu_weights.zig");
 const B = @import("text_runtime.zig").B;
+const rg = @import("round_graph.zig");
+
+/// A host-dependent stretch of one row: recorded as a deferred piece and re-run live (uncaptured) on every replay.
+fn Region(comptime M: type) type {
+    return struct {
+        const Self = @This();
+        m: M,
+        /// Kinds carry row indices only: live() reads the model's fresh row, so replays see this round's values.
+        kind: union(enum) {
+            embed: struct { at: u32 },
+            attention: struct { i: usize, at: u32 },
+            moe: struct { i: usize, at: u32, hashed: bool },
+            absorb: struct { at: u32 },
+        },
+
+        fn live(ctx: *anyopaque, stream: cuda.Stream) anyerror!void {
+            const s: *Self = @ptrCast(@alignCast(ctx));
+            _ = stream; // the round's stream is the model's own, current at every replay
+            switch (s.kind) {
+                .embed => |e| {
+                    const token = s.m.glive[e.at].token; // the model's refreshed row: a replay embeds this round's token
+                    try s.m.r.buf(.ids).upload(0, std.mem.asBytes(&token));
+                    const embed = try s.m.w.tensor("embed.weight");
+                    try s.m.r.operators.tensor.run(.embed, s.m.stream, .{ .x = @intCast((s.m.c.hidden_size + 127) / 128), .y = 1 }, 128, .{ embed.data.ptr, s.m.r.p(.ids), s.m.r.p(.h), @as(u32, @intCast(s.m.c.hidden_size)), @as(u32, @intCast(s.m.c.vocab_size)), @as(u32, @backingInt(try gpu.kind(embed.dtype))), @as(u32, 4) });
+                },
+                .attention => |a| {
+                    const seq = try s.m.sequence(s.m.glive[a.at].slot); // live at replay: the row's current sequence, its current length
+                    var b: [80]u8 = undefined;
+                    try attention(s.m, try key(&b, "layers.{d}", .{a.i}), &seq.layers[a.i], seq, seq.len, s.m.c.compress_ratios[a.i], null);
+                },
+                .moe => |o| {
+                    var b: [80]u8 = undefined;
+                    try moe(s.m, try key(&b, "layers.{d}", .{o.i}), o.hashed, s.m.glive[o.at].token >= s.m.c.vocab_size); // image-ness too: read fresh
+                },
+                .absorb => |a| try @import("dspark.zig").absorb(s.m, try s.m.sequence(s.m.glive[a.at].slot), (try s.m.sequence(s.m.glive[a.at].slot)).len),
+            }
+        }
+
+        fn destroy(ctx: *anyopaque) void {
+            const s: *Self = @ptrCast(@alignCast(ctx));
+            s.m.a.destroy(s);
+        }
+
+        fn deferStretch(r: *rg.Recorder, m: M, kind: @FieldType(Self, "kind")) !void {
+            const s = try m.a.create(Self);
+            errdefer m.a.destroy(s);
+            s.* = .{ .m = m, .kind = kind };
+            try r.deferSteps(1, .{ .ctx = s, .run = live, .dtor = destroy });
+        }
+    };
+}
 pub fn key(buf: []u8, comptime pattern: []const u8, args: anytype) ![]const u8 {
     return std.fmt.bufPrint(buf, pattern, args);
 }
@@ -37,6 +88,15 @@ pub fn hc(m: anytype, p: []const u8, part: []const u8) !void {
 pub fn post(m: anytype) !void {
     try m.r.operators.model.hcPost(m.stream, m.r.p(.out), m.r.p(.residual), m.r.p(.post), m.r.p(.comb), m.r.p(.h), 1, @intCast(m.c.hidden_size));
 }
+/// One cache row's bytes: the BF16 halves, or --kv-cache fp8's e4m3 codes with the one FP32 scale they share.
+pub fn rowBytes(m: anytype, dim: usize) usize {
+    return @import("state_plan.zig").rowBytes(dim, m.kv8);
+}
+/// One row into the cache: quantized to e4m3 when the sequence's rows are, a plain copy while they are still halves.
+pub fn writeRow(m: anytype, to: cuda.DeviceBuffer, at: usize, src: u64, dim: usize) !void {
+    if (m.kv8) return m.r.text.call("q8", m.stream, 1, @intCast(dim), .{ src, to.ptr + at, @as(u32, @intCast(dim)) });
+    return to.copyFrom(at, src, dim * 2, m.stream.handle);
+}
 fn compress(m: anytype, p: []const u8, cache: *st.Compressor, pos: u32, ratio: usize, dim: usize, index: bool) !void {
     var b: [160]u8 = undefined;
     const channels = dim * (if (ratio == 4) @as(usize, 2) else 1);
@@ -51,19 +111,19 @@ fn compress(m: anytype, p: []const u8, cache: *st.Compressor, pos: u32, ratio: u
         try m.r.text.call("rotate", m.stream, 1, 128, .{ m.r.p(.kv), @as(u32, 128) });
         try m.r.operators.model.qat(m.stream, m.r.p(.kv), 1, @intCast(dim), 32, true, @intCast(dim));
     } else try m.r.operators.model.qat(m.stream, m.r.p(.kv), 1, @intCast(dim - m.c.qk_rope_head_dim), 64, false, @intCast(dim));
-    try cache.cache.copyFrom(@as(usize, pos / @as(u32, @intCast(ratio))) * dim * 2, m.r.p(.kv), dim * 2, m.stream.handle);
+    try writeRow(m, cache.cache, @as(usize, pos / @as(u32, @intCast(ratio))) * rowBytes(m, dim), m.r.p(.kv), dim);
 }
 const Score = struct { value: f32, index: i32 };
 fn better(_: void, a: Score, b: Score) bool {
     return if (a.value == b.value) a.index < b.index else a.value > b.value;
 }
-pub fn attention(m: anytype, p: []const u8, l: *st.Layer, pos: u32, ratio: usize, visible: ?@import("image_layout.zig").Span) !void {
+pub fn attention(m: anytype, p: []const u8, l: *st.Layer, seq: *st.Sequence, pos: u32, ratio: usize, visible: ?@import("image_layout.zig").Span) !void {
     var b: [160]u8 = undefined;
     const heads = m.c.num_attention_heads / 2;
     const dim = m.c.head_dim;
     try query(m, p, pos, ratio > 0);
     try keyValue(m, p, pos, ratio > 0);
-    try l.kv.copyFrom(@as(usize, pos % m.c.sliding_window) * dim * 2, m.r.p(.kv), dim * 2, m.stream.handle);
+    try writeRow(m, l.kv, @as(usize, pos % m.c.sliding_window) * rowBytes(m, dim), m.r.p(.kv), dim);
     const count = if (ratio > 0) (pos + 1) / ratio else 0;
     if (ratio > 0) {
         try compress(m, try key(&b, "{s}.attn.compressor", .{p}), &l.compressor.?, pos, ratio, dim, false);
@@ -86,7 +146,9 @@ pub fn attention(m: anytype, p: []const u8, l: *st.Layer, pos: u32, ratio: usize
         try m.r.text.call("rotate", m.stream, @intCast(ih), 128, .{ m.r.p(.ixq), @as(u32, 128) });
         try m.r.operators.model.qat(m.stream, m.r.p(.ixq), @intCast(ih), @intCast(id), 32, true, @intCast(id));
         try rawProject(m, try key(&b, "{s}.attn.indexer.weights_proj.weight", .{p}), m.r.p(.norm), m.r.p(.ixw), m.c.hidden_size, ih, false, .bf16);
-        try m.r.text.call("index", m.stream, @intCast((count + 127) / 128), 128, .{ m.r.p(.ixq), l.indexer.?.cache.ptr, m.r.p(.ixw), m.r.p(.score), @as(u32, @intCast(count)), @as(u32, @intCast(ih)), @as(u32, @intCast(id)) });
+        if (m.kv8) { // the index's key rows are e4m3 too: the same FP32 accumulation, read through each row's scale
+            try m.r.text.call("index8", m.stream, @intCast((count + 127) / 128), 128, .{ m.r.p(.ixq), l.indexer.?.cache.ptr, m.r.p(.ixw), m.r.p(.score), @as(u32, @intCast(count)), @as(u32, @intCast(ih)), @as(u32, @intCast(id)), @as(u32, @intCast(rowBytes(m, id))) });
+        } else try m.r.text.call("index", m.stream, @intCast((count + 127) / 128), 128, .{ m.r.p(.ixq), l.indexer.?.cache.ptr, m.r.p(.ixw), m.r.p(.score), @as(u32, @intCast(count)), @as(u32, @intCast(ih)), @as(u32, @intCast(id)) });
         try m.comm.allGather(m.r.p(.score), m.r.p(.gather), count, .f32, m.stream);
         try m.r.text.call("merge", m.stream, @intCast((count + 127) / 128), 128, .{ m.r.p(.gather), m.r.p(.score), @as(u32, @intCast(count)), @as(u32, 2) });
         try m.sync();
@@ -107,7 +169,12 @@ pub fn attention(m: anytype, p: []const u8, l: *st.Layer, pos: u32, ratio: usize
     };
     try m.sync();
     try m.r.buf(.selected).upload(0, std.mem.sliceAsBytes(indices[0..selected]));
-    const full = l.kv.ptr;
+    var full = l.kv.ptr;
+    if (m.kv8) { // the sparse kernel reads BF16: the selected rows come back through their scales, into the sequence's one staging buffer
+        const rows = seq.staging orelse return error.MissingStaging;
+        try m.r.text.call("gather8", m.stream, @intCast(selected), 256, .{ l.kv.ptr, m.r.p(.selected), rows.ptr, @as(u32, @intCast(selected)), @as(u32, @intCast(dim)), @as(u32, @intCast(rowBytes(m, dim))) });
+        full = rows.ptr;
+    }
     try m.r.operators.model.sparse(m.stream, m.r.p(.q), full, m.r.p(.selected), try m.w.ptr(try key(&b, "{s}.attn.attn_sink", .{p})), m.r.p(.attn), .{ .rows = 1, .heads = @intCast(heads), .selected = @intCast(selected), .dim = @intCast(dim) });
     try outputProjection(m, p, pos, ratio > 0);
 
@@ -169,40 +236,61 @@ pub fn moe(m: anytype, p: []const u8, hashed: bool, image: bool) !void {
     }
     try m.r.text.call("round", m.stream, @intCast((m.c.hidden_size + 127) / 128), 128, .{ m.r.p(.accum), m.r.p(.out), @as(u32, @intCast(m.c.hidden_size)) });
 }
+pub const Head = enum { full, partial, none };
 pub fn step(m: anytype, seq: *st.Sequence, token: u32, sample: bool, logits: ?[]f32, embedded: u64) !void {
+    try body(m, seq, token, embedded, if (sample) Head.full else Head.none, logits);
+}
+/// One row's reference program; `.partial` leaves the logits half in the logits buffer for the round's single exchange.
+pub fn body(m: anytype, seq: *st.Sequence, token: u32, embedded: u64, head: Head, logits: ?[]f32) !void {
+    // a Recorder defers the host-dependent stretches (re-run live each replay); device-only frames record as graphs
+    return bodyRec(m, seq, token, embedded, head, logits, 0, null); // the row index is unread without a Recorder
+}
+
+/// The same program with a Recorder: four host stretches defer, the device-only frames become graph pieces.
+pub fn bodyRec(m: anytype, seq: *st.Sequence, token: u32, embedded: u64, head: Head, logits: ?[]f32, at: u32, rec: ?*rg.Recorder) !void {
+    const Reg = Region(@TypeOf(m));
     const pos = seq.len;
     if (pos >= m.context or (token >= m.c.vocab_size and embedded == 0)) return error.ContextOrTokenOutOfRange;
-    try m.r.buf(.ids).upload(0, std.mem.asBytes(&token));
-    if (embedded != 0) {
-        try m.r.operators.tensor.run(.expand, m.stream, .{ .x = @intCast((m.c.hidden_size + 127) / 128) }, 128, .{embedded, m.r.p(.h), @as(u32, @intCast(m.c.hidden_size))});
+    if (rec) |r| {
+        if (embedded != 0) try r.hostRead(); // a media row reached the graphed path: the plan lied, so the round goes eager
+        try Reg.deferStretch(r, m, .{ .embed = .{ .at = at } });
     } else {
-        const embed = try m.w.tensor("embed.weight");
-        try m.r.operators.tensor.run(.embed, m.stream, .{ .x = @intCast((m.c.hidden_size + 127) / 128), .y = 1 }, 128, .{ embed.data.ptr, m.r.p(.ids), m.r.p(.h), @as(u32, @intCast(m.c.hidden_size)), @as(u32, @intCast(m.c.vocab_size)), @as(u32, @backingInt(try gpu.kind(embed.dtype))), @as(u32, 4) });
+        try m.r.buf(.ids).upload(0, std.mem.asBytes(&token));
+        if (embedded != 0) {
+            try m.r.operators.tensor.run(.expand, m.stream, .{ .x = @intCast((m.c.hidden_size + 127) / 128) }, 128, .{embedded, m.r.p(.h), @as(u32, @intCast(m.c.hidden_size))});
+        } else {
+            const embed = try m.w.tensor("embed.weight");
+            try m.r.operators.tensor.run(.embed, m.stream, .{ .x = @intCast((m.c.hidden_size + 127) / 128), .y = 1 }, 128, .{ embed.data.ptr, m.r.p(.ids), m.r.p(.h), @as(u32, @intCast(m.c.hidden_size)), @as(u32, @intCast(m.c.vocab_size)), @as(u32, @backingInt(try gpu.kind(embed.dtype))), @as(u32, 4) });
+        }
     }
     for (seq.layers, 0..) |*l, i| {
         var b: [80]u8 = undefined;
         const p = try key(&b, "layers.{d}", .{i});
-        try hc(m, p, "attn");
-        try attention(m, p, l, pos, m.c.compress_ratios[i], null);
+        try hc(m, p, "attn"); // device-only frame: its launches record into the open capture
+        if (rec) |r| try Reg.deferStretch(r, m, .{ .attention = .{ .i = i, .at = at } }) else try attention(m, p, l, seq, pos, m.c.compress_ratios[i], null);
         try post(m);
         try hc(m, p, "ffn");
-        try moe(m, p, i < m.c.num_hash_layers, token >= m.c.vocab_size);
+        if (rec) |r| try Reg.deferStretch(r, m, .{ .moe = .{ .i = i, .at = at, .hashed = i < m.c.num_hash_layers } }) else try moe(m, p, i < m.c.num_hash_layers, token >= m.c.vocab_size);
         try post(m);
         for (m.c.dspark_target_layer_ids, 0..) |layer, tap| if (layer == i) {
             try m.r.operators.tensor.run(.tap, m.stream, .{ .x = @intCast((m.c.hidden_size + 127) / 128) }, 128,
                 .{ m.r.p(.h), seq.taps.ptr, @as(u32, @intCast(m.c.hidden_size)), @as(u32, @intCast(m.c.dspark_target_layer_ids.len)), @as(u32, @intCast(tap)) });
         };
     }
-    if (sample) {
+    if (head != .none) {
         try rawProject(m, "hc_head_fn", m.r.p(.h), m.r.p(.mixes), m.c.hidden_size * 4, 4, true, .f32);
         try m.r.operators.tensor.run(.collapse, m.stream, .{ .x = @intCast((m.c.hidden_size + 127) / 128), .y = 1 }, 128, .{ m.r.p(.h), m.r.p(.mixes), try m.w.ptr("hc_head_scale"), try m.w.ptr("hc_head_base"), m.r.p(.x), @as(u32, @intCast(m.c.hidden_size)), @as(f32, @floatCast(m.c.hc_eps)) });
         try norm(m, m.r.p(.x), try m.w.ptr("norm.weight"), m.r.p(.norm), m.c.hidden_size, 1, false);
         try project(m, "head", m.r.p(.norm), m.r.p(.logits), .f32);
-        try m.comm.allGather(m.r.p(.logits), m.r.p(.gather), m.c.vocab_size / 2, .f32, m.stream);
-        try m.sync();
-        if (logits) |out| try m.r.buf(.gather).download(0, std.mem.sliceAsBytes(out));
+        if (head == .full) {
+            try m.comm.allGather(m.r.p(.logits), m.r.p(.gather), m.c.vocab_size / 2, .f32, m.stream);
+            try m.sync();
+            if (logits) |out| try m.r.buf(.gather).download(0, std.mem.sliceAsBytes(out));
+        }
     }
-    try @import("dspark.zig").absorb(m, seq, pos);
-    try m.sync();
-    seq.len += 1;
+    if (rec) |r| try Reg.deferStretch(r, m, .{ .absorb = .{ .at = at } }) else try @import("dspark.zig").absorb(m, seq, pos);
+    if (rec == null) { // the graphed round's drain and advance belong to the step that launched it, not to a recording
+        try m.sync();
+        seq.len += 1;
+    }
 }
