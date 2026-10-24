@@ -227,6 +227,15 @@ image rows, draft state, staging/scratch and OS reserve. Host memory counts
 on unified-memory Sparks. An oversized context/concurrency is refused; the
 server does not silently reduce the requested 256K × 4 profile.
 
+On Linux integrated CUDA devices such as GB10, initial admission and subsequent
+rank-room negotiation use `/proc/meminfo`'s `MemAvailable` and `MemTotal`.
+Reclaimable file cache from scanning the rank payload counts as available;
+CUDA free bytes do not clamp this shared host pool. No extra switch is needed.
+The OS reserve and `TENSORFOLD_CUDA_MEMORY_LIMIT_GB` still apply. Discrete GPUs
+continue to use CUDA's free/total counts, and missing or invalid host counts
+on integrated devices refuse admission. This accounting fix does not establish
+that the full 256K × 4 vision profile fits or passes its hardware gates.
+
 By default the port keeps the reference semantics: rows run serially within
 shared lane rounds and NCCL gathers every round. The opt-ins above add batched
 rounds and the P2P all-add; CUDA Graph replay and an RDMA transport remain off.

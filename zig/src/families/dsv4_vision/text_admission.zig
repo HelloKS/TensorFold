@@ -24,40 +24,96 @@ pub fn check(a: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context, c: @imp
     if (need > granted) return error.MemoryBudgetExceeded;
 }
 const Pool = struct { available: u64, reserve: u64, room: u64 };
+const Counts = struct { total: u64, available: u64 };
 pub fn room(a: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context) !u64 { return (try inspect(a, io, ctx)).room; }
 fn inspect(a: std.mem.Allocator, io: std.Io, ctx: *const cuda.Context) !Pool {
     const card = try ctx.memInfo();
-    var available: u64 = card.free;
-    var total: u64 = card.total;
     const unified = (try ctx.attribute(.integrated)) != 0;
+    var host_text: ?[]u8 = null;
+    defer if (host_text) |text| a.free(text);
     if (unified) {
         var file = try std.Io.Dir.cwd().openFile(io, "/proc/meminfo", .{});
         defer file.close(io);
         var bytes: [4096]u8 = undefined;
         var reader = file.readerStreaming(io, &bytes);
-        const data = try reader.interface.allocRemaining(a, .limited(1 << 20));
-        defer a.free(data);
-        var lines = std.mem.tokenizeScalar(u8, data, '\n');
+        host_text = try reader.interface.allocRemaining(a, .limited(1 << 20));
+    }
+    const counts = try memoryCounts(.{ .total = card.total, .available = card.free }, unified, host_text);
+    const env = @import("native.zig").env;
+    const used = cuda.usage(false);
+    return budget(counts, env("TENSORFOLD_MEMORY_RESERVE_GIB"), env("TENSORFOLD_CUDA_MEMORY_LIMIT_GB"), used.device, used.host);
+}
+
+fn memoryCounts(card: Counts, unified: bool, host_text: ?[]const u8) !Counts {
+    var available = card.available;
+    var total = card.total;
+    if (unified) {
+        var lines = std.mem.tokenizeScalar(u8, host_text orelse return error.HostMemoryUnavailable, '\n');
         var host_free: ?u64 = null;
         var host_total: ?u64 = null;
         while (lines.next()) |line| {
             var words = std.mem.tokenizeAny(u8, line, ": \t");
             const name = words.next() orelse continue;
             if (!std.mem.eql(u8, name, "MemAvailable") and !std.mem.eql(u8, name, "MemTotal")) continue;
-            const n = try std.fmt.parseInt(u64, words.next() orelse return error.HostMemoryUnavailable, 10);
-            if (std.mem.eql(u8, name, "MemAvailable")) host_free = n * 1024 else host_total = n * 1024;
+            const n = std.fmt.parseInt(u64, words.next() orelse return error.HostMemoryUnavailable, 10) catch
+                return error.HostMemoryUnavailable;
+            if (!std.mem.eql(u8, words.next() orelse return error.HostMemoryUnavailable, "kB") or
+                words.next() != null) return error.HostMemoryUnavailable;
+            const bytes = std.math.mul(u64, n, 1024) catch return error.HostMemoryUnavailable;
+            if (std.mem.eql(u8, name, "MemAvailable")) {
+                if (host_free != null) return error.HostMemoryUnavailable;
+                host_free = bytes;
+            } else {
+                if (host_total != null) return error.HostMemoryUnavailable;
+                host_total = bytes;
+            }
         }
-        available = @min(available, host_free orelse return error.HostMemoryUnavailable);
+        // On integrated CUDA devices, MemAvailable includes reclaimable file cache that CUDA free may exclude.
+        available = host_free orelse return error.HostMemoryUnavailable;
         total = host_total orelse return error.HostMemoryUnavailable;
+        if (total == 0 or host_free.? > total) return error.HostMemoryUnavailable;
     }
-    const env = @import("native.zig").env;
-    const reserve = if (env("TENSORFOLD_MEMORY_RESERVE_GIB")) |s| try gib(s) else @max(@as(u64, 4 << 30), total / 10);
+    return .{ .total = total, .available = available };
+}
+
+fn budget(counts: Counts, reserve_text: ?[]const u8, limit_text: ?[]const u8, device: u64, host: u64) !Pool {
+    const available = counts.available;
+    const reserve = if (reserve_text) |s| try gib(s) else @max(@as(u64, 4 << 30), counts.total / 10);
     var granted = available -| reserve;
-    if (env("TENSORFOLD_CUDA_MEMORY_LIMIT_GB")) |s| {
-        const used = cuda.usage(false);
-        granted = @min(granted, (try gib(s)) -| used.device -| used.host);
+    if (limit_text) |s| {
+        granted = @min(granted, (try gib(s)) -| device -| host);
     }
     return .{ .available = available, .reserve = reserve, .room = granted };
+}
+
+test "GB10 admission counts reclaimable file cache instead of clamping to CUDA free" {
+    const card: Counts = .{ .total = 128 << 30, .available = 3371315200 };
+    const text = "MemTotal: 127535248 kB\nMemFree: 3683400 kB\nMemAvailable: 109608980 kB\n";
+    const counts = try memoryCounts(card, true, text);
+    try std.testing.expectEqual(@as(u64, 109608980) * 1024, counts.available);
+    const pool = try budget(counts, null, null, 0, 0);
+    const need: u64 = 84609416440 + 3808047424 + 2147483648 + 31027776;
+    try std.testing.expect(need <= pool.room);
+    try std.testing.expectEqual(counts.total / 10, pool.reserve);
+    try std.testing.expectEqual(card, try memoryCounts(card, false, text));
+    try std.testing.expect(need > (try budget(card, null, null, 0, 0)).room);
+}
+
+test "unified admission preserves reserves and memory limits and rejects invalid host counts" {
+    const g: u64 = 1 << 30;
+    const counts: Counts = .{ .total = 128 * g, .available = 100 * g };
+    try std.testing.expectEqual(80 * g, (try budget(counts, "20", null, 0, 0)).room);
+    try std.testing.expectEqual(57 * g, (try budget(counts, null, "60", g, 2 * g)).room);
+    try std.testing.expectEqual(@as(u64, 0), (try budget(counts, "120", null, 0, 0)).room);
+    try std.testing.expectEqual(@as(u64, 0), (try budget(counts, null, "2", 3 * g, 0)).room);
+    try std.testing.expectError(error.InvalidMemoryBudget, budget(counts, "nan", null, 0, 0));
+    for ([_]?[]const u8{
+        null, "", "MemTotal: 1024 kB\n", "MemTotal: bad kB\nMemAvailable: 1 kB\n",
+        "MemTotal: 1024 MB\nMemAvailable: 1 kB\n", "MemTotal: 0 kB\nMemAvailable: 0 kB\n",
+        "MemTotal: 1 kB\nMemAvailable: 2 kB\n", "MemTotal: 18446744073709551615 kB\nMemAvailable: 1 kB\n",
+        "MemTotal: 2 kB\nMemTotal: 2 kB\nMemAvailable: 1 kB\n",
+    }) |text| try std.testing.expectError(error.HostMemoryUnavailable, memoryCounts(counts, true, text));
+    try std.testing.expectEqual(counts, try memoryCounts(counts, false, null));
 }
 
 fn gib(s: []const u8) !u64 {
