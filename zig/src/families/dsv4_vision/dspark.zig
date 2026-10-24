@@ -5,6 +5,36 @@ const fw = @import("text_forward.zig");
 const st = @import("text_state.zig");
 const Kind = cuda.dsv4_tensor.Kind;
 
+const StageKeys = struct {
+    prefix_buf: [32]u8 = undefined,
+    sink_buf: [96]u8 = undefined,
+    prefix_len: usize = 0,
+    sink_len: usize = 0,
+
+    fn init(keys: *StageKeys, stage: usize) !void {
+        keys.prefix_len = (try fw.key(&keys.prefix_buf, "mtp.{d}", .{stage})).len;
+        keys.sink_len = (try fw.key(&keys.sink_buf, "{s}.attn.attn_sink", .{keys.prefix()})).len;
+    }
+
+    fn prefix(keys: *const StageKeys) []const u8 {
+        return keys.prefix_buf[0..keys.prefix_len];
+    }
+
+    fn sink(keys: *const StageKeys) []const u8 {
+        return keys.sink_buf[0..keys.sink_len];
+    }
+};
+
+test "DSpark attention sink formatting preserves the stage prefix for every proposal row" {
+    var keys: StageKeys = .{};
+    try keys.init(0);
+    try std.testing.expectEqualStrings("mtp.0", keys.prefix());
+    try std.testing.expectEqualStrings("mtp.0.attn.attn_sink", keys.sink());
+    try keys.init(12);
+    try std.testing.expectEqualStrings("mtp.12", keys.prefix());
+    try std.testing.expectEqualStrings("mtp.12.attn.attn_sink", keys.sink());
+}
+
 pub fn absorb(m: anytype, seq: *st.Sequence, pos: u32) !void {
     try fw.project(m, "mtp.0.main_proj", seq.taps.ptr, m.r.p(.x), .bf16);
     try fw.norm(m, m.r.p(.x), try m.w.ptr("mtp.0.main_norm.weight"), seq.main.ptr, m.c.hidden_size, 1, false);
@@ -64,8 +94,10 @@ pub fn propose(m: anytype, seq: *st.Sequence, token: u32, out: []u32) !void {
     try m.sync();
     try m.r.buf(.selected).upload(0, std.mem.sliceAsBytes(selected[0 .. past + size]));
     for (seq.draft, 0..) |*layer, stage| {
-        var b: [96]u8 = undefined;
-        const p = try fw.key(&b, "mtp.{d}", .{stage});
+        var names: StageKeys = .{};
+        try names.init(stage);
+        const p = names.prefix();
+        const sink = try m.w.ptr(names.sink());
         for (0..size) |i| {
             try m.r.buf(.h).copyFrom(0, block.ptr + i * hbytes, hbytes, m.stream.handle);
             try fw.hc(m, p, "attn");
@@ -81,7 +113,6 @@ pub fn propose(m: anytype, seq: *st.Sequence, token: u32, out: []u32) !void {
             try m.r.buf(.h).copyFrom(0, block.ptr + i * hbytes, hbytes, m.stream.handle);
             try fw.hc(m, p, "attn");
             try m.r.buf(.q).copyFrom(0, queries.ptr + i * qbytes, qbytes, m.stream.handle);
-            const sink = try m.w.ptr(try fw.key(&b, "{s}.attn.attn_sink", .{p}));
             try @import("sparse_rows.zig").run(m, seq.staging, layer.kv.ptr, sink, past + size);
             try fw.outputProjection(m, p, seq.len + @as(u32, @intCast(i)), false);
             try fw.post(m);

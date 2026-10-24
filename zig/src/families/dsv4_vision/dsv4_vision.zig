@@ -58,5 +58,6 @@ test {
     _ = @import("link.zig");
     _ = @import("window_cost.zig");
     _ = @import("text_admission.zig");
+    _ = @import("dspark.zig");
     _ = @import("rounds_ranks_test.zig");
 }
